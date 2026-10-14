@@ -1,0 +1,1 @@
+fork-merge batch 6 fixup: clippy needless_pass_by_value on the 32 graft — with_provider takes &SharedCredentialsProvider and &Region; just ci green
