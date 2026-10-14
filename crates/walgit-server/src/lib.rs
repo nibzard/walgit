@@ -103,6 +103,9 @@ pub struct AppState {
     pub follow: follow::FollowStatuses,
     /// In-process TLS (standalone, D39); `None` behind an edge (h2c).
     pub tls: Option<Arc<tls::Tls>>,
+    /// `[policy] baseline`, parsed at startup: judged before every repository's own
+    /// `policy.json` (`docs/POLICY.md`). In memory, so it costs a push no store request.
+    pub policy_baseline: Option<policy::RepoPolicy>,
 }
 
 impl AppState {
@@ -119,6 +122,14 @@ impl AppState {
             None
         };
         let tls = tls::load(&cfg)?;
+        let policy_baseline = policy::load_baseline(&cfg)?;
+        if let Some(p) = &policy_baseline {
+            tracing::info!(
+                rules = p.rules.len(),
+                groups = p.groups.len(),
+                "push policy baseline loaded"
+            );
+        }
         if let Some(t) = &tls {
             tracing::info!(fingerprint = %t.fingerprint, mode = ?cfg.server.tls.mode, "TLS terminated in-process");
         }
@@ -136,6 +147,7 @@ impl AppState {
             bridge,
             follow: follow::FollowStatuses::default(),
             tls,
+            policy_baseline,
         }))
     }
 }
@@ -420,6 +432,9 @@ pub(crate) async fn dispatch_route(
             (&Method::DELETE, "") => admin::delete(st, route, &headers).await,
             // Admin routes reach here only through `/{o}/{r}/api[-browser]/…` (web::v1).
             (&Method::GET, "policy") => policy::http_get(st, route, &headers).await,
+            (&Method::GET, "policy/effective") => {
+                policy::http_get_effective(st, route, &headers).await
+            }
             (&Method::PUT, "policy") => {
                 policy::http_put(st, route, &headers, body.take().unwrap()).await
             }
