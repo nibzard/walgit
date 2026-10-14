@@ -407,15 +407,32 @@ async fn git_lfs_pushes_straight_to_the_bucket_and_verifies_with_us() -> Result<
     Ok(())
 }
 
-/// A `git credential` helper (git ≥ 2.46 authtype protocol) that hands out
-/// `TOKEN`. Written next to the repo so nothing global is touched.
+/// A `git credential` helper that hands out `TOKEN`. Written next to the repo
+/// so nothing global is touched. git ≥ 2.46 fillers that ask for the authtype
+/// capability get the bearer form; a filler that asks without it — git-lfs
+/// before 3.6 knows only username/password — gets the classic pair, which the
+/// server accepts because it takes a static token as a Basic password too.
 fn bearer_helper(dir: &std::path::Path) -> Result<String> {
     let path = dir.join("bearer-helper");
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\ncase \"$1\" in get) while IFS= read -r l; do [ -z \"$l\" ] && break; done; \
-             printf 'capability[]=authtype\\nauthtype=Bearer\\ncredential={TOKEN}\\n\\n' ;; esac\n"
+            r#"#!/bin/sh
+case "$1" in
+get)
+  authtype=0
+  while IFS= read -r l; do
+    [ -z "$l" ] && break
+    [ "$l" = 'capability[]=authtype' ] && authtype=1
+  done
+  if [ "$authtype" = 1 ]; then
+    printf 'capability[]=authtype\nauthtype=Bearer\ncredential={TOKEN}\n\n'
+  else
+    printf 'username=lfs\npassword={TOKEN}\n\n'
+  fi
+  ;;
+esac
+"#
         ),
     )?;
     #[cfg(unix)]

@@ -709,6 +709,13 @@ impl Authenticator {
         let p = self.authenticate(headers).await?;
         if p.write {
             Ok(p)
+        } else if p.anonymous {
+            // No credential was presented at all: answer with the 401 challenge,
+            // like `require_read` does. git and git-lfs consult their credential
+            // helpers (and retry) only on 401; a bare 403 here ends the exchange
+            // before the client can authenticate — the LFS upload batch since it
+            // requires write (#63) hit exactly that.
+            Err(AuthError::Unauthorized)
         } else {
             Err(AuthError::Forbidden)
         }
