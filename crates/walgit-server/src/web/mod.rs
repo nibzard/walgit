@@ -24,7 +24,7 @@ pub(crate) fn out_of_scope() -> ApiError {
     ApiError::NotFound(walgit_wal::WalError::NotFound.to_string())
 }
 
-/// `proxy` mode's owner scope (D50) on every matched route under a repository prefix —
+/// `proxy` mode's owner scope (D52) on every matched route under a repository prefix —
 /// the routes with `{owner}` and `{repo}` path parameters: the JSON API in both lanes, repo
 /// admin, UI data and pages. Installed once as a `route_layer` over all merged routers, so
 /// a new repository route inherits it; the fallback dispatcher (git smart HTTP, LFS, `.git`
