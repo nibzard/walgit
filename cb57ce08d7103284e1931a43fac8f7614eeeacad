@@ -1,0 +1,1 @@
+fork-merge batch 4: PR #59; gate green (just ci + s3 contract); condition_store literal patched per plan, duplicate use std::sync::Arc removed; source branch pull/59/head 223f956
