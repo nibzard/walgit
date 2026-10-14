@@ -1,0 +1,1 @@
+fork-merge batch 6: PR #66; gate green (just test); bridge.rs doc+helpers union (105's notified_keys(v, store_prefix) + {"repo"} arm kept, 66's event_type()/validation_code() added), EVENTS.md union
