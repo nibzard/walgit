@@ -40,7 +40,6 @@ pub struct Config {
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
-    pub http2: bool,
     /// Per-repo cap on concurrent upload-pack/receive-pack processes.
     pub max_concurrent_per_repo: usize,
     /// Graceful drain after SIGTERM: new object work (fetch/push/LFS) is
@@ -256,7 +255,6 @@ pub enum StoreBackend {
 pub struct GcsConfig {
     /// gRPC endpoint.
     pub endpoint: String,
-    pub direct_connectivity: bool,
     /// Service account for signed URLs; None = ADC/IAM signBlob.
     pub signing_service_account: Option<String>,
     /// Separate data clients (own channels) for bulk traffic — pack/idx/side-
@@ -825,7 +823,6 @@ impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             listen: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
-            http2: true,
             max_concurrent_per_repo: 64,
             drain_timeout: Duration::from_secs(20),
             max_push_bytes: ByteSize::gib(64),
@@ -880,7 +877,6 @@ impl Default for GcsConfig {
     fn default() -> Self {
         GcsConfig {
             endpoint: "https://storage.googleapis.com".into(),
-            direct_connectivity: true,
             signing_service_account: None,
             bulk_clients: 4,
             bulk_concurrency: 32,
@@ -1614,6 +1610,16 @@ mod tests {
         let input = "[git]\nbinary = \"/opt/git/bin/git\"\n";
         assert!(Config::parse(input).is_err());
         assert!(Config::default().with_settings(input).is_err());
+    }
+
+    #[test]
+    fn removed_transport_switches_are_rejected() {
+        for input in [
+            "[server]\nhttp2 = false\n",
+            "[store.gcs]\ndirect_connectivity = false\n",
+        ] {
+            assert!(Config::parse(input).is_err(), "{input}");
+        }
     }
 
     #[test]
