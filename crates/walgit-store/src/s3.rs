@@ -111,13 +111,24 @@ impl S3Store {
             ),
         };
 
+        // Both clients (mutation + read) must resolve and refresh one identity.
+        // Two details keep them coherent:
+        // - set_credentials_provider stores `creds` as-is; the chaining
+        //   `credentials_provider` helper would wrap it in a second
+        //   SharedCredentialsProvider and mint a fresh identity-cache
+        //   partition per client, so each client would run its own STS
+        //   exchange schedule.
+        // - one shared lazy identity cache store, keyed by the shared
+        //   partition, holds the single refreshed credential.
+        let identity_cache = aws_sdk_s3::config::IdentityCache::lazy().build();
         let build_config = |retry_config| {
             let mut s3_config = aws_sdk_s3::Config::builder()
                 .region(region.clone())
-                .credentials_provider(creds.clone())
+                .identity_cache(identity_cache.clone())
                 .force_path_style(cfg.s3.force_path_style)
                 .retry_config(retry_config)
                 .behavior_version_latest();
+            s3_config.set_credentials_provider(Some(creds.clone()));
 
             if !cfg.s3.endpoint.is_empty() {
                 s3_config = s3_config.endpoint_url(&cfg.s3.endpoint);
