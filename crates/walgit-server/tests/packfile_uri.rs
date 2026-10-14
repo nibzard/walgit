@@ -333,7 +333,11 @@ async fn stock_git_downloads_static_baseline_and_native_residual_while_gix_stays
         // (URI downloads included), and the clone recipe asks for URIs.
         let helper = "credential.helper=!f() { test \"$1\" = get || return 0; printf 'capability[]=authtype\\nauthtype=Bearer\\ncredential=test-reader\\nusername=token\\npassword=test-reader\\n'; }; f";
         let proactive_auth = format!("http.{}/.proactiveAuth=auto", front.base_url);
-        let opt_in = ["-c", "remote.origin.serverOption=uri-auth=proactive"];
+        // `git clone --server-option` is the documented flag; the recipe's
+        // `clone -c remote.origin.serverOption=...` form reaches the new
+        // repository's config only after the transport is set up on git 2.47,
+        // so this clone would never actually ask.
+        let opt_in = ["--server-option=uri-auth=proactive"];
         if proactive {
             // Asking for URIs without proactive auth: git downloads them bare, gets the 401
             // and has no fallback, which is why the server never infers the option.
