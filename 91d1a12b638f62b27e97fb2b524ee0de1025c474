@@ -1,0 +1,1 @@
+fork-merge batch 5: PR #60; gate green (just test + just e2e + s3 contract); s3.rs new() hand-merge per plan recipe (SharedCredentialsProvider both arms, region.clone); follow-up fixup 07586f0 restores single shared credential identity; source branch pull/60/head 0372cb9
