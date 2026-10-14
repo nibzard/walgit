@@ -111,7 +111,7 @@ impl S3Store {
             ),
         };
 
-        Self::with_provider(cfg, creds, region)
+        Self::with_provider(cfg, &creds, &region)
     }
 
     /// Same, with the credentials already in hand. Signing is offline, so this is
@@ -129,15 +129,15 @@ impl S3Store {
             secret_key,
             session_token,
         ));
-        Self::with_provider(cfg, creds, region)
+        Self::with_provider(cfg, &creds, &region)
     }
 
     /// One provider feeds both clients: mutations never retry, reads retry
     /// `cfg.max_retries` times.
     fn with_provider(
         cfg: &walgit_config::StoreConfig,
-        creds: SharedCredentialsProvider,
-        region: aws_sdk_s3::config::Region,
+        creds: &SharedCredentialsProvider,
+        region: &aws_sdk_s3::config::Region,
     ) -> anyhow::Result<Self> {
         // Both clients (mutation + read) must resolve and refresh one identity.
         // Two details keep them coherent:
