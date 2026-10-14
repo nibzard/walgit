@@ -56,9 +56,25 @@ pub async fn info_refs(
         // 200 + ERR answer made git keep — and re-`store` — a dead cached token for the cache's
         // whole lifetime (rig, 2026-08-22: every clone failed for 50 minutes).
         let has_creds = headers.contains_key(axum::http::header::AUTHORIZATION);
+        let retry_cannot_help = matches!(
+            e,
+            crate::auth::AuthError::Forbidden | crate::auth::AuthError::Unavailable
+        );
+        // A proxy that did not prove itself: nothing the client holds can fix it, and behind
+        // a proxy `Authorization` has usually been consumed already — say so in band.
+        if is_git_client(headers)
+            && !service_param.is_empty()
+            && matches!(e, crate::auth::AuthError::UntrustedProxy)
+        {
+            return Ok(git_err_response(
+                &service_param,
+                &format!("walgit: {}", crate::error::UNTRUSTED_PROXY_MESSAGE),
+            ));
+        }
         if is_git_client(headers)
             && !service_param.is_empty()
             && has_creds
+            && retry_cannot_help
             && let Some(message) = auth_help_message(st, headers, &e)
         {
             return Ok(git_err_response(&service_param, &message));
@@ -1568,7 +1584,11 @@ pub(crate) fn auth_help_message(
         crate::auth::AuthError::Unavailable => Some(format!(
             "walgit: authentication is temporarily unavailable for {host}. Try again shortly.\n{provider}"
         )),
-        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => None,
+        // UntrustedProxy is dead here: the caller answers it first, in band,
+        // with the proxy message (`error::UNTRUSTED_PROXY_MESSAGE`).
+        crate::auth::AuthError::Invalid
+        | crate::auth::AuthError::Unauthorized
+        | crate::auth::AuthError::UntrustedProxy => None,
     }
 }
 
@@ -1663,6 +1683,7 @@ pub(crate) fn auth_err(e: crate::auth::AuthError) -> ApiError {
             ApiError::Unauthorized
         }
         crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::UntrustedProxy => ApiError::UntrustedProxy,
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
         }
