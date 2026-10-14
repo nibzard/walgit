@@ -1,0 +1,1 @@
+fork-merge batch 8 fixup: packfile_uri bare-URI 401 leg — use git clone --server-option (documented since 2.22) instead of 'clone -c remote.origin.serverOption', which git 2.47 only writes into the new repo's config after the fetch; matches D50's own version note
