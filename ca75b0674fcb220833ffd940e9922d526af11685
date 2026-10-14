@@ -1,0 +1,1 @@
+Merge PR #96 (proxy auth mode). 7 conflicts per drill. Deviation: auth_help_message match needed UntrustedProxy added to the None arm (96 added the enum variant; 102's version was exhaustive over 4). Kept 6280911 require_write 401/403 semantics (auth.rs automerge verified). Renumbered 96's D50 block + two inline proxy refs to D52.
