@@ -1,0 +1,1 @@
+fork-merge batch 4: PR #90; gate green (just ci + s3 contract); s3.rs test literal patched per plan (read_client + max_retries); source branch pull/90/head 34f240d
