@@ -1,0 +1,1 @@
+Merge PR #97 (descriptions + owner profiles). 6 conflicts per drill. api_v1.rs: took ours complete + appended 97's 391-line descriptions_and_owner_profiles test (97's change was purely additive at the base). Renumbered 97's D50 block/description.json/profile.json refs to D53; fixed web/mod.rs owner-scope comment D50->D52.
