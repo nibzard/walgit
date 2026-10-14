@@ -1,0 +1,1 @@
+fork-merge batch 7: PR #91; gate green (just test + just e2e 43/0/1); forced 2-file conflict resolved per drill (both sides deleted in 3 lib.rs hunks + toml hunk; both rejection tests kept, 89's first; CONFIG BREAK server.http2 + store.gcs.direct_connectivity accepted in the fork)
