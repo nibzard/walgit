@@ -1,0 +1,27 @@
+# Context
+
+## Background
+PR #106 introduced entity_tag and fixed the single-shot PUT and presigned
+GET conditional sites, but three sites from PR #59 kept sending the bare
+unquoted token: conditional DELETE, and CompleteMultipartUpload If-Match
+in compose and multipart_put.
+
+## Why This Way
+S3 versions are stored unquoted (quotes trimmed on every read), so the
+wire form must be rebuilt on every conditional request. entity_tag quotes
+once and is idempotent for an already-quoted value, so it is safe for all
+callers.
+
+## Gotchas
+- Do NOT port this fix to azure.rs: it stores versions in the quoted wire
+  form already (version_of keeps the ETag as the service sent it), so its
+  etag() pass-through helper is correct and quoting again would double-
+  quote. azure/tests.rs pins the quoted form.
+- gcs.rs needs no counterpart: conditions ride on numeric generations
+  (parse_generation -> i64), not entity-tags.
+- The tests module condition fakes hold the quoted wire form; reverting
+  any production site to the bare token fails three named tests.
+
+## Related
+- entity_tag helper and single-PUT fix: commit 7143aad (PR #106)
+- Conditional sites introduced: commit 223f956 (PR #59)
