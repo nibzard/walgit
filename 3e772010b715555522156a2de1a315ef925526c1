@@ -1,0 +1,19 @@
+# Context
+
+## Why This Way
+Remote names here are inverted from convention: origin is upstream
+(tobi/walgit) and fork is our fork (nibzard/walgit). The banner and
+CLAUDE.md exist so every agent and human sees the one-way flow before
+touching anything. CLAUDE.md is just "@AGENTS.md" because Claude Code
+loads CLAUDE.md while Codex loads AGENTS.md.
+
+## Gotchas
+- The pushurl=no-push guard on origin is LOCAL git config only. It is
+  not in this commit, so a fresh clone does not have it. Re-apply with:
+  git remote set-url --push origin no-push
+- Renaming the remotes was considered and rejected: it would break
+  muscle memory and the merge plan assumes current names.
+
+## Related
+- Upstream merges follow the 12-batch plan at
+  /home/agent/merge-plan-walgit.md (local machine).
