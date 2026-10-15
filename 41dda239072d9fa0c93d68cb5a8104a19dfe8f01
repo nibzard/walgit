@@ -1,0 +1,1 @@
+Refreshed tla2tools v1.8.0 sha256 pin (db131ddb... -> 0f56d6a8...) per the plan's environment probe; provenance comment notes the 2026-10-15 re-verification and the old pin. just spec green on first run after the refresh (jar downloaded fresh; all required passes, mutations and witnesses verified) — covers 59 StoreConditions and 65 StagedPublication.
