@@ -186,6 +186,17 @@ async fn v1_surface_and_browser_lane() -> TestResult {
     assert_eq!(b["contents"], "# v1\n");
     let c = json(&server, &format!("/o/r/api/commits?ref={head}")).await?;
     assert_eq!(c["commits"][0]["subject"], "initial");
+    // Discovery lists the compare endpoint (D57).
+    let endpoints: Vec<&str> = d["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap())
+        .collect();
+    assert!(
+        endpoints.iter().any(|e| e.contains("/api/compare/{base}...{head}")),
+        "discovery must list compare: {endpoints:?}"
+    );
     let c = json(&server, &format!("/o/r/api/commit/{head}")).await?;
     assert_eq!(c["commit"]["sha"], head);
     // Trailers split off the body (git interpret-trailers rules); body keeps the prose + URL.

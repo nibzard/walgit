@@ -256,6 +256,7 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "GET  /{owner}/{repo}/api/blob/{rev}/{path}[?raw]",
             "GET  /{owner}/{repo}/api/commits?ref&path&skip&n",
             "GET  /{owner}/{repo}/api/commit/{sha}",
+            "GET  /{owner}/{repo}/api/compare/{base}...{head}?skip&n   (merge base, ahead/behind, head-side commits, numstat, capped patch)",
             "GET  /{owner}/{repo}/api/overview",
             "GET  /{owner}/{repo}/api/tasks[/{id}]",
             "GET  /{owner}/{repo}/api/ops",

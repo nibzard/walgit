@@ -99,8 +99,8 @@ falls in the first:
 
 | Class | URLs | Headers |
 |---|---|---|
-| **Sha-addressed, immutable** | `tree/{sha}/…`, `blob/{sha}/…`, `commits?ref={sha}`, `commit/{sha}` where `{sha}` is a full 40-hex sha | `Cache-Control: private, max-age=31536000, immutable`. Content can never change; browsers never re-ask. |
-| **Ref-dependent** | `owners`, `owners/{o}`, `owners/{o}/repos` (with or without `?detail=1`), `description`, `refs`, `refs/branches`, `refs/tags`, `resolve/…`, and any tree/blob/commits/commit addressed by a *name* | `Cache-Control: private, max-age=0, stale-while-revalidate=60` and, where there is a natural one, `ETag: "<resolved sha>"` with `If-None-Match` → `304`. The metadata answers (`?detail=1` listings, `owners/{o}`, `description`) have no natural version and carry a digest of their body as `ETag`. |
+| **Sha-addressed, immutable** | `tree/{sha}/…`, `blob/{sha}/…`, `commits?ref={sha}`, `commit/{sha}`, `compare/{sha}...{sha}` where `{sha}` is a full 40-hex sha (compare: **both** sides) | `Cache-Control: private, max-age=31536000, immutable`. Content can never change; browsers never re-ask. |
+| **Ref-dependent** | `owners`, `owners/{o}`, `owners/{o}/repos` (with or without `?detail=1`), `description`, `refs`, `refs/branches`, `refs/tags`, `resolve/…`, and any tree/blob/commits/commit addressed by a *name*, and any compare addressed by a name (one or both sides) | `Cache-Control: private, max-age=0, stale-while-revalidate=60` and, where there is a natural one, `ETag: "<resolved sha>"` with `If-None-Match` → `304`. Paged answers fold the query into the validator (`commits` carries `skip`/`n`/`path`, compare `skip`/`n`), so each page is its own representation. The metadata answers (`?detail=1` listings, `owners/{o}`, `description`) have no natural version and carry a digest of their body as `ETag`. |
 
 Flow per navigation: one ref-dependent call (`resolve`, SWR — paints
 instantly from cache, revalidates in the background; a `304` costs the
@@ -468,7 +468,7 @@ Linear history page.
 - `skip` (default 0) and `n` (default 35, server may cap; walgit caps at
   200). `more` is true when at least one more commit exists after this page
   (walgit asks for `n+1`). Pagination in the UI is "Older" → `skip +=
-  commits.length`.
+  commits.length`. A `skip` past 1 000 000 000 is a `400`.
 - Order: `git log` default (reverse chronological, topo where needed).
 - `commits` is `[]` (never null) for an empty result; unknown ref → 404.
 
@@ -519,6 +519,72 @@ list by `commit_date` day and shows `subject` + `author`.
 - Merge commits: diff against the **first parent** (GitHub semantics;
   walgit passes `--diff-merges=first-parent`). Do not return a combined
   (`diff --cc`) patch or an empty patch with non-empty `stats`.
+
+### `GET /{owner}/{repo}/api/compare/{base}...{head}?skip=&n=`
+
+What changed between two refs, in one answer — the question a review tool or an
+agent working on a branch needs answered without a clone.
+
+```json
+{
+  "base":       { "ref": "main",      "sha": "807d45a6…" },
+  "head":       { "ref": "feature/x", "sha": "5ed435d9…" },
+  "merge_base": "33419c76…",
+  "ahead": 1,
+  "behind": 42,
+  "commits": [ …Commit… ],
+  "more": false,
+  "stats":   [ { "path": "src/app.rs", "additions": 12, "deletions": 3 } ],
+  "patch": "diff --git …",
+  "patch_truncated": false
+}
+```
+
+- Each side is any revision `resolve` accepts (branch — slashes included —
+  tag, `HEAD`, full or abbreviated sha), resolved once by the §3 rule.
+  `...` cannot occur in a ref name (`git check-ref-format` forbids `..`), so
+  the split is unambiguous; a missing `...`, an empty side or more than two
+  parts is a clean `400`. `base`/`head` echo the resolved `ref` + `sha`, so
+  the client never re-splits. Percent-encoded slashes in either side
+  (`feature%2Fx`) decode to the same ref.
+- `ahead`/`behind` are the exact counts (`git rev-list --left-right --count`);
+  `commits` is **one page of the head side only**, newest first, with the same
+  `Commit` shape as `commits` — `skip` (default 0) and `n` (default 35, cap
+  200), `more` true when at least one further commit exists. UI pagination is
+  the "Older" pattern: `skip += commits.length`.
+- `stats` (same shape as `commit/{sha}`) and `patch` (same renderer rules:
+  `-M`, `--no-color`, `--no-ext-diff`, binary `-1`, renames once with the new
+  path) are the **merge-base→head** diff — the three-dot form a review shows,
+  never `base..head`. `stats` is complete; `patch` stops at **2 MiB**, cut at a
+  whole-file boundary where possible, with `patch_truncated: true` (a single
+  file whose patch alone exceeds the cap can still be cut mid-file: treat the
+  flag as "partial input").
+- Identical sides: `merge_base` = that sha, `ahead == behind == 0`,
+  `commits: []`, `stats: []`, `patch: ""`. Unrelated histories (no merge
+  base): `404` naming both sides. Unknown side, or one that does not resolve
+  to a commit: `404`. No two-dot form, no `?path=` — a per-file patch is a
+  later decision if someone needs it.
+- Cache: **both** sides full 40-hex shas → immutable (a year, walgit also
+  keeps the render in its LRU and the shared store cache). Any name,
+  abbreviated sha, `HEAD` or mixed form → SWR + `ETag: "<base sha>...<head
+  sha>-<skip>-<n>"` → `304`. `skip`/`n` are part of the immutable identity
+  **and** of the ETag, so each page is its own representation and one page
+  never revalidates to another's body (the same rule as `commits`, whose
+  validator carries `skip`/`n`/`path`).
+- Bounds: `skip` past 1 000 000 000 is a `400` (the page is certainly empty
+  and the value must not wrap the window arithmetic); a `?path=`-less diff
+  that touches more than 20 000 objects is the truthful `503` on every
+  instance, and `patch` stops at 2 MiB as above.
+- Remote instances (a repository whose packs do not fit the host) answer from
+  the WAL pack set like `commit/{sha}`: commits and diff objects are read
+  through the remote reader. The bilateral merge-base/ahead/behind walk stops
+  at the common frontier (git's `queue_has_nonstale`), so it reads
+  ahead + behind commits — not the shared ancestry — at most 50 000 of them,
+  and the diff at most 20 000 objects; past either bound the truthful `503` +
+  `Retry-After` names it. On multiple merge bases the walk's pick can differ
+  from local git's, so the merge base and the diff can differ between the two
+  lanes for the same criss-cross compare; ahead/behind are set differences and
+  stay identical either way.
 
 ### `GET /{owner}/{repo}/api/overview` — optional, walgit-specific
 
@@ -636,6 +702,10 @@ GET /o/r/api/commits?ref=<sha>&path=&skip=0     → 200 {ref,sha,commits,more}; 
 GET /o/r/api/commit/<sha>                       → 200 {commit,stats,patch}; immutable
 GET /o/r/api/commit/<sha[:8]>                   → 200; SWR + ETag "<full sha>"
 GET /o/r/api/commit/deadbeef                    → 404 text/plain
+GET /o/r/api/compare/main...feature/x           → 200 {base,head,merge_base,ahead,behind,commits,more,stats,patch,patch_truncated}; SWR + ETag "<base>...<head>-<skip>-<n>"
+GET /o/r/api/compare/<sha>...<sha>              → 200 same shape; immutable
+GET /o/r/api/compare/main                       → 400 text/plain (expected {base}...{head})
+GET /o/r/api/compare/main...nope                → 404 text/plain
 POST /o/r/api/ops/snapshot?at_seq=1             → SSE, result {built, snapshot:{at_seq:1, head_seq, refs, packs}}
 GET /o/r/api/snapshot/1                         → 200 {at_seq,head_seq,refs,packs,git_dir}; no-store
 GET /o/r/api/snapshot/99999                     → 404 text/plain (not materialized here)

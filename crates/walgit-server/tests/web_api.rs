@@ -53,6 +53,27 @@ fn hdr(h: &reqwest::header::HeaderMap, k: &str) -> String {
         .to_string()
 }
 
+/// `git_in` with extra environment: the clock-skew fixture pins committer
+/// dates, because the remote compare walk orders pops by `commit_time`.
+fn git_env(
+    dir: &std::path::Path,
+    envs: &[(&str, &str)],
+    args: &[&str],
+) -> anyhow::Result<String> {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .envs(envs.iter().copied())
+        .args(args)
+        .output()?;
+    anyhow::ensure!(
+        out.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
 async fn json(server: &Server, path: &str) -> anyhow::Result<Value> {
     let (status, text, ct) = get(server, path).await?;
     anyhow::ensure!(status.is_success(), "GET {path} -> {status}: {text}");
@@ -313,6 +334,17 @@ async fn conformance(
     assert_eq!(first["parents"], serde_json::json!([]));
     assert!(first["author_date"].as_str().unwrap().contains('T'));
     assert_eq!(get(server, "/o/r/api/commits?ref=nope").await?.0, 404);
+    // commits pages carry their own validator too: skip (and path) are in the
+    // ETag, so one page never 304s another (RFC 9110).
+    let (_, _, h) = get_h(server, "/o/r/api/commits?ref=main&n=2", &[]).await?;
+    let e = hdr(&h, "etag");
+    let (st, _, _) = get_h(
+        server,
+        "/o/r/api/commits?ref=main&n=2&skip=2",
+        &[("If-None-Match", &e)],
+    )
+    .await?;
+    assert_eq!(st, 200, "commits page 2 must not 304 on page 1's ETag");
 
     // commit detail: rename + merge (first-parent)
     let d = json(server, &format!("/o/r/api/commit/{feature}")).await?;
@@ -351,6 +383,142 @@ async fn conformance(
     let (st, _, ct) = get(server, "/o/r/api/commit/deadbeef").await?;
     assert_eq!(st, 404);
     assert!(!ct.unwrap_or_default().contains("json"));
+
+    // compare: shape + exact counts vs git. feature/x was merged into main,
+    // so its tip is the merge base of main...feature/x (ahead 0); the branch
+    // shape shows against the commit it forked from.
+    let initial = git_in(src, &["rev-parse", "main~42"])?.trim().to_string();
+    let (st, text, h) = get_h(server, "/o/r/api/compare/main...feature/x", &[]).await?;
+    assert_eq!(st, 200, "{text}");
+    let c: Value = serde_json::from_str(&text)?;
+    assert_eq!(c["base"], serde_json::json!({ "ref": "main", "sha": head }));
+    assert_eq!(c["head"], serde_json::json!({ "ref": "feature/x", "sha": feature }));
+    assert_eq!(c["merge_base"], feature, "feature/x is merged: it IS the merge base");
+    let counts = git_in(src, &["rev-list", "--left-right", "--count", "main...feature/x"])?
+        .trim()
+        .to_string();
+    let (behind, ahead): (usize, usize) = counts
+        .split_once('\t')
+        .map(|(b, a)| (b.parse().unwrap(), a.parse().unwrap()))
+        .unwrap();
+    assert_eq!(c["ahead"], ahead, "ahead vs git: {counts}");
+    assert_eq!(c["behind"], behind, "behind vs git: {counts}");
+    assert_eq!(ahead, 0, "fixture: feature/x is fully merged");
+    assert_eq!(behind, 42);
+    assert_eq!(c["commits"], serde_json::json!([]));
+    assert_eq!(c["more"], false);
+    assert_eq!(c["stats"], serde_json::json!([]));
+    assert_eq!(c["patch"], "");
+    // names → SWR + ETag of the two resolved shas; If-None-Match → 304
+    assert!(hdr(&h, "cache-control").contains("stale-while-revalidate"));
+    let etag = hdr(&h, "etag");
+    assert_eq!(etag, format!("\"{head}...{feature}-0-35\""));
+    let (st, _, _) = get_h(
+        server,
+        "/o/r/api/compare/main...feature/x",
+        &[("If-None-Match", &etag)],
+    )
+    .await?;
+    assert_eq!(st, 304);
+    // Each page is its own representation: skip/n are in the ETag, so page 2
+    // is never page 1's 304 (RFC 9110).
+    let (st, _, h2) = get_h(
+        server,
+        "/o/r/api/compare/main...feature/x?skip=35&n=35",
+        &[("If-None-Match", &etag)],
+    )
+    .await?;
+    assert_eq!(st, 200, "a different page must not 304");
+    assert_ne!(hdr(&h2, "etag"), etag);
+
+    // the branch shape: initial...feature/x has the merge base at the fork
+    let (st, text, _) = get_h(server, &format!("/o/r/api/compare/{initial}...feature/x"), &[]).await?;
+    assert_eq!(st, 200);
+    let c: Value = serde_json::from_str(&text)?;
+    assert_eq!(c["merge_base"], initial);
+    assert_eq!(c["ahead"], 1);
+    assert_eq!(c["behind"], 0);
+    let cs = c["commits"].as_array().unwrap();
+    assert_eq!(cs.len(), 1);
+    assert_eq!(cs[0]["sha"], feature);
+    assert_eq!(cs[0]["subject"], "feature work");
+    assert_eq!(c["more"], false);
+    let paths: Vec<&str> = c["stats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        paths.contains(&"src/app.rs") && paths.contains(&"dir/f.txt"),
+        "stats carry the rename and the new file: {paths:?}"
+    );
+    assert!(c["patch"].as_str().unwrap().contains("diff --git a/"));
+    assert_eq!(c["patch_truncated"], false);
+    // percent-encoded slash in the head = the same ref (SDK per-segment enc)
+    let c2 = json(server, &format!("/o/r/api/compare/{initial}...feature%2Fx")).await?;
+    assert_eq!(c2["head"]["ref"], "feature/x");
+    assert_eq!(c2["head"]["sha"], feature);
+    // both sides full shas → immutable, byte-identical second answer
+    let (st, text, h) = get_h(server, &format!("/o/r/api/compare/{initial}...{feature}"), &[]).await?;
+    assert_eq!(st, 200);
+    assert!(hdr(&h, "cache-control").contains("immutable"));
+    let (st2, text2, _) = get_h(server, &format!("/o/r/api/compare/{initial}...{feature}"), &[]).await?;
+    assert_eq!(st2, 200);
+    assert_eq!(text, text2, "second hit served from the immutable cache");
+    // the other direction pages through main's 42 commits
+    let c = json(server, "/o/r/api/compare/feature/x...main?n=1").await?;
+    assert_eq!(c["ahead"], 42);
+    assert_eq!(c["behind"], 0);
+    assert_eq!(c["more"], true);
+    assert_eq!(c["commits"].as_array().unwrap().len(), 1);
+    assert_eq!(c["commits"][0]["sha"], head);
+    let c = json(server, "/o/r/api/compare/feature/x...main?skip=1&n=1").await?;
+    assert_eq!(c["commits"][0]["subject"], "filler");
+    // identical sides: empty diff, itself as merge base
+    let c = json(server, "/o/r/api/compare/main...main").await?;
+    assert_eq!(c["merge_base"], head);
+    assert_eq!(c["ahead"], 0);
+    assert_eq!(c["behind"], 0);
+    assert_eq!(c["commits"], serde_json::json!([]));
+    assert_eq!(c["stats"], serde_json::json!([]));
+    assert_eq!(c["patch"], "");
+    // malformed ranges: 400, plain text, before any resolution
+    for bad in [
+        "/o/r/api/compare",
+        "/o/r/api/compare/",
+        "/o/r/api/compare/main",
+        "/o/r/api/compare/...main",
+        "/o/r/api/compare/main...",
+        "/o/r/api/compare/a...b...c",
+    ] {
+        let (st, body, ct) = get(server, bad).await?;
+        assert_eq!(st, 400, "{bad}: {body}");
+        assert!(!ct.unwrap_or_default().contains("json"), "{bad}");
+    }
+    // unknown sides
+    assert_eq!(get(server, "/o/r/api/compare/main...nope").await?.0, 404);
+    assert_eq!(get(server, "/o/r/api/compare/nope...main").await?.0, 404);
+    // a full tag-object sha peels on both lanes, as `resolve` does
+    let tag_sha = git_in(src, &["rev-parse", "v1.0"])?.trim().to_string();
+    let c = json(server, &format!("/o/r/api/compare/{tag_sha}...main")).await?;
+    assert_eq!(c["base"]["ref"], tag_sha, "ref stays the raw sha");
+    assert_eq!(c["base"]["sha"], v1_peeled, "sha is the peeled commit");
+    assert_eq!(c["merge_base"], v1_peeled);
+    assert_eq!(c["ahead"], 40, "the 40 filler commits");
+    // an absurd skip is a 400, never a wrapped window
+    for path in [
+        "/o/r/api/compare/main...feature/x?skip=18446744073709551615&n=1",
+        "/o/r/api/commits?ref=main&skip=18446744073709551615",
+        "/o/r/api/compare/main...feature/x?skip=1000000001",
+    ] {
+        let (st, body, _) = get(server, path).await?;
+        assert_eq!(st, 400, "{path}: {body}");
+    }
+    // the largest accepted skip answers coherently (empty, no more)
+    let c = json(server, "/o/r/api/compare/main...feature/x?skip=1000000000&n=1").await?;
+    assert_eq!(c["commits"], serde_json::json!([]));
+    assert_eq!(c["more"], false);
     Ok(())
 }
 
@@ -510,7 +678,14 @@ async fn legacy_api_prefix_is_gone() -> TestResult {
     server.put_repo("o", "r").await?;
     let src = fixture(&server)?;
     let _ = git_in(&src, &["rev-parse", "HEAD"])?;
-    for path in ["refs", "resolve/main", "tree/main", "tasks", "overview"] {
+    for path in [
+        "refs",
+        "resolve/main",
+        "tree/main",
+        "compare/main...main",
+        "tasks",
+        "overview",
+    ] {
         let (sa, a, _) = get_h(&server, &format!("/o/r/api/{path}"), &[]).await?;
         assert_eq!(sa, 200, "{path}: {a}");
         let (sb, _, _) = get_h(&server, &format!("/o/r/api-browser/{path}"), &[]).await?;
@@ -584,5 +759,387 @@ async fn browser_localhost_redirects_to_walgit_localhost() -> TestResult {
         .send()
         .await?;
     assert_ne!(git.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    Ok(())
+}
+
+/// The happy path on a plain 3-commit branch off main (D57): merge base at
+/// the fork point, exact counts, newest-first head-side commits, paging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compare_three_commit_branch() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("o", "r").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    std::fs::write(dir.join("base.txt"), "base\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "root"])?;
+    let fork = git_in(&dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    git_in(&dir, &["checkout", "-q", "-b", "topic/deep/name"])?;
+    for i in 1..=3 {
+        std::fs::write(dir.join(format!("f{i}.txt")), format!("f{i}\n"))?;
+        git_in(&dir, &["add", "."])?;
+        git_in(&dir, &["commit", "-q", "-m", &format!("feature {i}")])?;
+    }
+    git_in(&dir, &["checkout", "-q", "main"])?;
+    for i in 1..=2 {
+        std::fs::write(dir.join(format!("m{i}.txt")), format!("m{i}\n"))?;
+        git_in(&dir, &["add", "."])?;
+        git_in(&dir, &["commit", "-q", "-m", &format!("main {i}")])?;
+    }
+    let main_tip = git_in(&dir, &["rev-parse", "main"])?.trim().to_string();
+    let topic_tip = git_in(&dir, &["rev-parse", "topic/deep/name"])?
+        .trim()
+        .to_string();
+    git_in(
+        &dir,
+        &["push", "-q", "--mirror", &server.repo_url("o", "r")],
+    )?;
+
+    // A slash-bearing branch name resolves on both sides of `...`.
+    let c = json(&server, "/o/r/api/compare/main...topic/deep/name").await?;
+    assert_eq!(c["merge_base"], fork);
+    assert_eq!(c["ahead"], 3);
+    assert_eq!(c["behind"], 2);
+    let subjects: Vec<&str> = c["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(subjects, vec!["feature 3", "feature 2", "feature 1"]);
+    assert_eq!(c["more"], false);
+    let paths: Vec<&str> = c["stats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["f1.txt", "f2.txt", "f3.txt"]);
+    assert!(c["patch"].as_str().unwrap().contains("+f2"));
+
+    // Paging: n=2 leaves one more; skip walks to it.
+    let c = json(&server, "/o/r/api/compare/main...topic/deep/name?n=2").await?;
+    let subjects: Vec<&str> = c["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(subjects, vec!["feature 3", "feature 2"]);
+    assert_eq!(c["more"], true);
+    let c = json(&server, "/o/r/api/compare/main...topic/deep/name?n=2&skip=2").await?;
+    let subjects: Vec<&str> = c["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(subjects, vec!["feature 1"]);
+    assert_eq!(c["more"], false);
+
+    // The reverse direction is the mirror image (and exercises the ETag).
+    let (_, text, h) = get_h(&server, "/o/r/api/compare/topic/deep/name...main", &[]).await?;
+    let c: Value = serde_json::from_str(&text)?;
+    assert_eq!(c["ahead"], 2);
+    assert_eq!(c["behind"], 3);
+    assert_eq!(hdr(&h, "etag"), format!("\"{topic_tip}...{main_tip}-0-35\""));
+    Ok(())
+}
+
+/// `patch_truncated`: the patch stops at 2 MiB on a whole-file boundary;
+/// `stats` stays complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compare_patch_truncated() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("o", "r").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    std::fs::write(dir.join("empty"), "")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "root"])?;
+    git_in(&dir, &["checkout", "-q", "-b", "big"])?;
+    // Two files whose patches together exceed the 2 MiB cap, each alone under
+    // it: the cut must keep the first file whole and drop the second.
+    std::fs::write(dir.join("big1.txt"), vec![b'1'; 1200 * 1024])?;
+    std::fs::write(dir.join("big2.txt"), vec![b'2'; 1200 * 1024])?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "big files"])?;
+    git_in(
+        &dir,
+        &["push", "-q", "--mirror", &server.repo_url("o", "r")],
+    )?;
+
+    let c = json(&server, "/o/r/api/compare/main...big").await?;
+    assert_eq!(c["ahead"], 1);
+    assert_eq!(c["patch_truncated"], true, "{}", c["patch"].as_str().unwrap().len());
+    let patch = c["patch"].as_str().unwrap();
+    assert!(patch.len() <= 2 * 1024 * 1024);
+    assert!(patch.contains("diff --git a/big1.txt b/big1.txt"));
+    assert!(!patch.contains("diff --git a/big2.txt b/big2.txt"));
+    let paths: Vec<&str> = c["stats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["big1.txt", "big2.txt"], "stats stay complete");
+    Ok(())
+}
+
+/// The unrelated-histories contract for one lane.
+async fn assert_unrelated(server: &Server) -> anyhow::Result<()> {
+    let (st, body, ct) = get(server, "/o/orphan/api/compare/main...side").await?;
+    assert_eq!(st, 404, "{body}");
+    assert!(body.contains("no merge base"), "{body}");
+    assert!(body.contains("main") && body.contains("side"), "{body}");
+    assert!(!ct.unwrap_or_default().contains("json"));
+    Ok(())
+}
+
+/// `compare/{b}...{h}` with no common ancestor: a 404 naming both sides — on
+/// the local-packs instance and on a 1-byte-cache sibling, where the remote
+/// walk drains without ever finding a merge base.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compare_unrelated_histories() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("o", "orphan").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    std::fs::write(dir.join("a.txt"), "a\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "root a"])?;
+    git_in(&dir, &["checkout", "-q", "--orphan", "side"])?;
+    git_in(&dir, &["rm", "-rqf", "."])?;
+    std::fs::write(dir.join("b.txt"), "b\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "root b"])?;
+    git_in(
+        &dir,
+        &["push", "-q", "--mirror", &server.repo_url("o", "orphan")],
+    )?;
+
+    assert_unrelated(&server).await?;
+    let small = server
+        .start_sibling_with(|cfg| {
+            cfg.cache.max_bytes = bytesize::ByteSize::b(1);
+        })
+        .await?;
+    assert_unrelated(&small).await?;
+    Ok(())
+}
+
+/// The criss-cross contract for one lane: exact counts and a merge base git
+/// itself accepts.
+async fn assert_criss_cross(server: &Server, bases: &[String]) -> anyhow::Result<()> {
+    let c = json(server, "/o/cc/api/compare/main...topic").await?;
+    assert_eq!(c["ahead"], 1, "only M2 is topic-side: {}", c["ahead"]);
+    assert_eq!(c["behind"], 1, "only M1 is main-side");
+    let mb = c["merge_base"].as_str().unwrap();
+    assert!(
+        bases.contains(&mb.to_string()),
+        "merge base {mb} must be one of {bases:?}"
+    );
+    Ok(())
+}
+
+/// Criss-cross (two merge bases): counts exact, and the reported merge base
+/// is one git itself accepts (`merge-base --all`) — asserted on both lanes,
+/// so the remote walk's pick is covered too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compare_criss_cross() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("o", "cc").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    std::fs::write(dir.join("a"), "a\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "A"])?;
+    git_in(&dir, &["branch", "topic"])?;
+    std::fs::write(dir.join("b"), "b\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "B"])?;
+    let b = git_in(&dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    git_in(&dir, &["checkout", "-q", "topic"])?;
+    std::fs::write(dir.join("c"), "c\n")?;
+    git_in(&dir, &["add", "."])?;
+    git_in(&dir, &["commit", "-q", "-m", "C"])?;
+    // main merges topic; topic merges main's pre-merge tip B by sha — the
+    // classic two-merge-base shape.
+    git_in(&dir, &["checkout", "-q", "main"])?;
+    git_in(&dir, &["merge", "-q", "--no-ff", "-m", "M1", "topic"])?;
+    git_in(&dir, &["checkout", "-q", "topic"])?;
+    git_in(&dir, &["merge", "-q", "--no-ff", "-m", "M2", &b])?;
+    git_in(
+        &dir,
+        &["push", "-q", "--mirror", &server.repo_url("o", "cc")],
+    )?;
+    let all = git_in(&dir, &["merge-base", "--all", "main", "topic"])?;
+    let bases: Vec<String> = all.lines().map(str::trim).map(str::to_string).collect();
+    assert_eq!(bases.len(), 2, "fixture must be a criss-cross: {all}");
+
+    assert_criss_cross(&server, &bases).await?;
+    let small = server
+        .start_sibling_with(|cfg| {
+            cfg.cache.max_bytes = bytesize::ByteSize::b(1);
+        })
+        .await?;
+    assert_criss_cross(&small, &bases).await?;
+    Ok(())
+}
+
+/// The clock-skew contract for one lane: counts exact after retraction, and
+/// every page window holds real head-side commits.
+async fn assert_skew(server: &Server, c2: &str) -> anyhow::Result<()> {
+    let c = json(server, "/o/skewrepo/api/compare/skewbase...skew").await?;
+    assert_eq!(c["merge_base"], c2, "C2 is the merge base");
+    assert_eq!(c["ahead"], 5, "M, H1..H4: {}", c["ahead"]);
+    assert_eq!(c["behind"], 1, "only D is base-side");
+    // A page window over the retraction-corrected head side.
+    let c = json(server, "/o/skewrepo/api/compare/skewbase...skew?n=3").await?;
+    let subjects: Vec<&str> = c["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(subjects, vec!["M", "H4", "H3"], "no common commit, no gap");
+    assert_eq!(c["more"], true);
+    // The documented pattern (skip += commits.length) delivers the rest.
+    let c = json(server, "/o/skewrepo/api/compare/skewbase...skew?n=3&skip=3").await?;
+    let subjects: Vec<&str> = c["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(subjects, vec!["H2", "H1"]);
+    assert_eq!(c["more"], false, "ahead 5, skip 3 + n 3 covers it");
+    Ok(())
+}
+
+/// Clock skew (a common commit dated newer than its descendants): commits
+/// counted head-side above the frontier are retracted, so counts stay exact
+/// and every page carries real head-side commits. The remote walk is where
+/// retraction and the page window interact, so both lanes are asserted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compare_skewed_dates() -> TestResult {
+    /// Pin both dates of one commit: the walk orders pops by `commit_time`.
+    fn at(d: &'static str) -> Vec<(&'static str, &'static str)> {
+        vec![("GIT_AUTHOR_DATE", d), ("GIT_COMMITTER_DATE", d)]
+    }
+    let big = Server::start().await?;
+    big.put_repo("o", "skewrepo").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    // R (Apr); skewbase: C1 (Jun 1) -> C2 (Jun 2) -> D (Jan, skewed older
+    // than its own history); skew: R -> H1..H4 (May) -> M (merge of C2,
+    // May 5). C2 is the merge base; C1/C2/R are common but dated newer than
+    // D, so the walk counts them head-side before the frontier is found.
+    let r_env = at("2026-04-01T12:00:00Z");
+    git_env(&dir, &r_env, &["commit", "-q", "--allow-empty", "-m", "R"])?;
+    let root = git_in(&dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    git_in(&dir, &["checkout", "-q", "-b", "skewbase"])?;
+    git_env(&dir, &at("2026-06-01T12:00:00Z"), &["commit", "-q", "--allow-empty", "-m", "C1"])?;
+    git_env(&dir, &at("2026-06-02T12:00:00Z"), &["commit", "-q", "--allow-empty", "-m", "C2"])?;
+    let c2 = git_in(&dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    git_env(&dir, &at("2026-01-01T12:00:00Z"), &["commit", "-q", "--allow-empty", "-m", "D"])?;
+    git_in(&dir, &["checkout", "-q", "-b", "skew", &root])?;
+    for (i, d) in [
+        ("1", "2026-05-01T12:00:00Z"),
+        ("2", "2026-05-02T12:00:00Z"),
+        ("3", "2026-05-03T12:00:00Z"),
+        ("4", "2026-05-04T12:00:00Z"),
+    ] {
+        git_env(
+            &dir,
+            &at(d),
+            &["commit", "-q", "--allow-empty", "-m", &format!("H{i}")],
+        )?;
+    }
+    git_env(
+        &dir,
+        &at("2026-05-05T12:00:00Z"),
+        &["merge", "-q", "--no-ff", "-m", "M", &c2],
+    )?;
+    git_in(
+        &dir,
+        &["push", "-q", "--mirror", &big.repo_url("o", "skewrepo")],
+    )?;
+
+    assert_skew(&big, &c2).await?;
+    let small = big
+        .start_sibling_with(|cfg| {
+            cfg.cache.max_bytes = bytesize::ByteSize::b(1);
+        })
+        .await?;
+    assert_skew(&small, &c2).await?;
+    Ok(())
+}
+
+/// The remote walk stops at the common frontier: a tiny range over deep
+/// shared history pops ahead+behind commits, not the shared ancestry. The
+/// walk reports a `commits` progress bar per 100 pops, so the SSE envelope
+/// of a remotely served compare is the cheapest observable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compare_walk_stops_at_frontier() -> TestResult {
+    let big = Server::start().await?;
+    big.put_repo("o", "deep").await?;
+    let dir = tempfile::tempdir()?.keep();
+    git_in(&dir, &["init", "-q", "-b", "main"])?;
+    git_in(&dir, &["config", "user.email", "t@t"])?;
+    git_in(&dir, &["config", "user.name", "Tester"])?;
+    // 120 commits of shared history — more than one progress bar's worth.
+    for _ in 0..120 {
+        git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "trunk"])?;
+    }
+    let main_tip = git_in(&dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    git_in(&dir, &["checkout", "-q", "-b", "topic"])?;
+    git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "one commit on top"])?;
+    let topic_tip = git_in(&dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    git_in(
+        &dir,
+        &["push", "-q", "--mirror", &big.repo_url("o", "deep")],
+    )?;
+    let small = big
+        .start_sibling_with(|cfg| {
+            cfg.cache.max_bytes = bytesize::ByteSize::b(1);
+        })
+        .await?;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{}/o/deep/api/compare/main...topic", small.base_url))
+        .header("Accept", "application/json, text/event-stream")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    assert!(
+        hdr(resp.headers(), "content-type").starts_with("text/event-stream"),
+        "remote compare streams"
+    );
+    let text = resp.text().await?;
+    assert!(
+        !text.contains("\"unit\":\"commits\""),
+        "a 1-commit range must not walk the 120-commit shared ancestry: {text}"
+    );
+    let result = text
+        .split("\n\n")
+        .find(|p| p.starts_with("event: result"))
+        .expect("result packet");
+    let c: Value =
+        serde_json::from_str(result.trim_start_matches("event: result\ndata: "))?;
+    assert_eq!(c["ahead"], 1);
+    assert_eq!(c["behind"], 0);
+    assert_eq!(c["merge_base"], main_tip);
+    assert_eq!(c["commits"][0]["sha"], topic_tip);
     Ok(())
 }

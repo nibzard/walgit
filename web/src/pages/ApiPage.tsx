@@ -129,6 +129,11 @@ export function ApiPage() {
               desc={<><code>{`{commit,stats:[{path,additions,deletions}],patch}`}</code> — unified diff against the first parent; any revision accepted.</>}
               cache="full sha → immutable · else SWR + ETag"
             />
+            <Row
+              path={`/${r}/api/compare/{base}...{head}`}
+              desc={<>Between two refs: <code>{`{base,head,merge_base,ahead,behind,commits,more,stats,patch,patch_truncated}`}</code> — merge base, ahead/behind, head-side commits, numstat and a capped patch (three-dot diff).</>}
+              cache="both shas → immutable · else SWR + ETag"
+            />
             <Row path={`/${r}/api/description`} desc={<><code>{`{description?}`}</code> — one line of plain text (<code>GET</code> read; <code>PUT</code>/<code>DELETE</code> admin).</>} cache="SWR + ETag" />
             <Row path={`/${r}/api/policy`} desc={<>Push policy document (<code>GET</code> read; <code>PUT</code>/<code>DELETE</code> admin).</>} cache="no-store" />
             <Row
