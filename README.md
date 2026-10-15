@@ -1,5 +1,9 @@
 # walgit — a git server that is one binary in front of an object store
 
+> **This is a fork.** `origin` is upstream (`tobi/walgit`); our fork is the `fork` remote
+> (`nibzard/walgit`). Fetch and merge from `origin`; push every branch to `fork`. Never push
+> to `origin` and never open a pull request against upstream.
+
 walgit hosts git repositories with **no database, no leader and no local state that matters**. You run a
 single binary, point it at an S3 or GCS bucket, and you have: smart HTTP (v0/v2) fetch and push, Git LFS, a browsing web UI, a JSON API with an SDK, per-repository push policy,
 webhooks — and a server that scales to repositories **larger than the machine it runs on**. Every machine that

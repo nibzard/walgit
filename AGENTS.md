@@ -1,5 +1,10 @@
 # walgit — architecture and operating manual for contributors (humans and agents)
 
+> **This repository is a fork of walgit.** The remotes are inverted from convention: `origin` is
+> upstream (`tobi/walgit`) and `fork` is our fork (`nibzard/walgit`). Work flows one way only:
+> fetch and merge from `origin`, push every branch to `fork`. Never push to `origin`. Never open
+> a pull request, send a patch, or file an issue against upstream.
+
 Context: **everyone, first.** Read this before touching the repository: the constraints the design answers
 (§1), how the WAL works (§2), the principles a PR is judged against (§3), every design decision in force (§4),
 and the working rules (§5). Reading order starts at `GOAL.md`; §0 maps every other document.
