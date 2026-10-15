@@ -220,7 +220,7 @@ impl S3Store {
             }
             match req.send().await {
                 Ok(response)
-                    if matches!(response.status().as_u16(), 429 | 500..=599)
+                    if matches!(response.status().as_u16(), 408 | 429 | 500..=599)
                         && attempt < self.max_retries =>
                 {
                     tracing::warn!(
@@ -294,7 +294,7 @@ impl S3Store {
                 key: key.into(),
                 current: etag.map(Version::new),
             }),
-            s if s >= 500 || s == 429 => {
+            s if s >= 500 || s == 408 || s == 429 => {
                 Err(StoreError::Retryable(anyhow::anyhow!("s3 get status {s}")))
             }
             s => Err(StoreError::Other(anyhow::anyhow!("s3 get status {s}"))),
@@ -1627,6 +1627,22 @@ mod tests {
         attempts.store(0, Ordering::SeqCst);
         assert!(zero.head("k").await.unwrap_err().is_retryable());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// The presigned-GET loop must retry 408 like the SDK paths do
+    /// (`is_transient_status`): the same request may succeed when repeated.
+    #[tokio::test]
+    async fn presigned_get_retries_request_timeout() {
+        let (endpoint, attempts) = counting_fake_s3(408, "RequestTimeout").await;
+        let store = store_for_attempts(&endpoint, 2);
+        let result = store.get("k", GetOptions::default()).await;
+        let error = result.err().expect("408 after retries must error");
+        assert!(error.is_retryable(), "{error:?}");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "initial attempt plus two retries"
+        );
     }
 
     async fn put_error(client: &S3Client) -> SdkError<PutObjectError> {
