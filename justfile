@@ -98,7 +98,7 @@ test:
     scripts/test-dev-store-preflight.sh
     {{t5}} cargo test --workspace --lib --bins
     {{t10}} cargo test -p walgit-store -p walgit-git -p walgit-wal --tests
-    {{t10}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test packfile_uri --test forward --test maintain --test routing_prefix --test metrics --test lfs_upstream --test lfs_signed_url --test drain --test events --test follow --test policy
+    {{t10}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test packfile_uri --test forward --test maintain --test routing_prefix --test metrics --test lfs_upstream --test lfs_signed_url --test drain --test events --test follow --test policy --test snapshot
     just test-plugin
 
 # Exercise the actual native boundary, including stream and store destruction.

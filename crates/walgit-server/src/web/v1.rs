@@ -260,6 +260,7 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
             "GET  /{owner}/{repo}/api/tasks[/{id}]",
             "GET  /{owner}/{repo}/api/ops",
             "POST /{owner}/{repo}/api/ops/{op}",
+            "GET  /{owner}/{repo}/api/snapshot/{seq}   (a WAL rewind materialized by ops/snapshot)",
             "GET|PUT|DELETE /{owner}/{repo}/api/description",
             "GET|PUT|DELETE /{owner}/{repo}/api/policy",
             "GET  /{owner}/{repo}/api/policy/effective",
