@@ -5,11 +5,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 JAR="$ROOT/target/tla2tools.jar"
 VERSION="v1.8.0"
-# v1.8.0 is a rolling upstream asset, not an immutable release. This pin
-# identifies 867aefb69ffc2452031292587b389d1fc3eb43ff (2026-09-12). A mismatch fails closed: inspect
+# v1.8.0 is a rolling upstream asset, not an immutable release. This pin was
+# re-verified 2026-10-15: the previous pin (867aefb69ffc2452031292587b389d1fc3eb43ff,
+# 2026-09-12, sha256 db131ddb48e7004d823bef4493df7b35694babe37505b9d9fa5685e7a331f1f1)
+# no longer matched the asset. A mismatch fails closed: inspect
 # MANIFEST.MF, upstream commit history and the release asset digest before
 # changing it. Never accept an unverified replacement automatically.
-SHA256="db131ddb48e7004d823bef4493df7b35694babe37505b9d9fa5685e7a331f1f1"
+SHA256="0f56d6a813368c48008dfbecb23a73ab43a4a5e1bf09f026782a674aa9d4b3c9"
 URL="https://github.com/tlaplus/tlaplus/releases/download/$VERSION/tla2tools.jar"
 
 command -v java >/dev/null || { echo "TLA+: Java 11+ is required" >&2; exit 2; }
