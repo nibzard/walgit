@@ -32,10 +32,17 @@ use walgit_store::{GetOptions, ObjectStore, Prefixed, PutBody, PutMode};
 use walgit_wal::{ObjectAccess, RepoHandle, Reporter};
 
 use crate::sse::Rendered;
-use crate::web::objects::{CommitMeta, Remote};
+use crate::web::objects::{CommitMeta, Remote, MAX_DIFF_OBJECTS};
 use crate::{AppState, auth::AuthError, cache::RefIndex, error::ApiError};
 
 const MAX_BLOB: usize = 2 * 1024 * 1024;
+/// Cap on one compare patch (`compare/{base}...{head}`): past it the patch is
+/// cut at a whole-file boundary and the answer carries `patch_truncated`.
+const MAX_PATCH: usize = 2 * 1024 * 1024;
+/// Upper bound on `skip` for the paged endpoints (`commits`, `compare`).
+/// Past it the page is certainly empty and the value only risks overflowing
+/// the window arithmetic, so it is a clean 400 like a malformed range.
+const MAX_SKIP: usize = 1_000_000_000;
 const IMMUTABLE: &str = "private, max-age=31536000, immutable";
 const SWR: &str = "private, max-age=0, stale-while-revalidate=60";
 const DEFAULT_PAGE: usize = 100;
@@ -190,6 +197,32 @@ struct RefListQuery {
     after: Option<String>,
     n: Option<usize>,
 }
+#[derive(serde::Deserialize, Default)]
+struct CompareQuery {
+    skip: Option<usize>,
+    n: Option<usize>,
+}
+#[derive(Serialize)]
+struct CompareSide {
+    #[serde(rename = "ref")]
+    ref_name: String,
+    sha: String,
+}
+#[derive(Serialize)]
+struct Compare {
+    base: CompareSide,
+    head: CompareSide,
+    merge_base: String,
+    ahead: usize,
+    behind: usize,
+    /// One page of head-side commits, newest first (§4 `commits` shape).
+    commits: Vec<Commit>,
+    more: bool,
+    /// Complete numstat of the merge-base→head diff (three-dot form).
+    stats: Vec<Stat>,
+    patch: String,
+    patch_truncated: bool,
+}
 
 pub fn router(state: Arc<AppState>) -> Router {
     // D26/D27: repo-scoped endpoints live under the repository's own prefix,
@@ -211,7 +244,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/tree/{{*rest}}"), get(tree))
             .route(&format!("{base}/blob/{{*rest}}"), get(blob))
             .route(&format!("{base}/commits"), get(commits))
-            .route(&format!("{base}/commit/{{sha}}"), get(commit_detail));
+            .route(&format!("{base}/commit/{{sha}}"), get(commit_detail))
+            .route(&format!("{base}/compare"), get(compare_root))
+            .route(&format!("{base}/compare/"), get(compare_root))
+            .route(&format!("{base}/compare/{{*rest}}"), get(compare));
     }
     r.with_state(state)
 }
@@ -431,14 +467,27 @@ fn is_full_sha(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// `skip` of a paged endpoint, bounds-checked: a caller-supplied usize that
+/// must never reach window arithmetic unchecked.
+fn page_skip(skip: Option<usize>) -> Result<usize, ApiError> {
+    let skip = skip.unwrap_or(0);
+    if skip > MAX_SKIP {
+        return Err(ApiError::BadRequest(format!(
+            "skip must be at most {MAX_SKIP}"
+        )));
+    }
+    Ok(skip)
+}
+
 /// Finish a ref-or-sha addressed request: immutable (+LRU +shared cache) or
-/// SWR+ETag (304 handled by `Rendered::into_response`).
+/// SWR+ETag (304 handled by `Rendered::into_response`). `etag` must identify
+/// exactly one representation, so paged endpoints fold their query in.
 fn finish(
     st: &AppState,
     r: &Repo,
     immutable: bool,
     cache_key: &str,
-    sha: &str,
+    etag: &str,
     body: bytes::Bytes,
 ) -> Rendered {
     if immutable {
@@ -460,7 +509,7 @@ fn finish(
         }
         return Rendered::json(body, IMMUTABLE, None);
     }
-    Rendered::json(body, SWR, Some(etag_for(sha)))
+    Rendered::json(body, SWR, Some(etag_for(etag)))
 }
 
 // ---- instance ----------------------------------------------------------------
@@ -743,6 +792,26 @@ async fn resolve_name(r: &Repo, name: &str) -> Result<Resolved, ApiError> {
     })
 }
 
+/// Resolve one side of a `compare/{base}...{head}` (D57): the §3 name rule
+/// for names, and `rev-parse^{commit}` for a full sha — a sha that names an
+/// annotated tag object peels to its commit on both lanes, exactly what
+/// `resolve` answers for the same input (`ref` stays the raw sha, `sha` is
+/// the commit).
+async fn compare_side(r: &Repo, raw: &str) -> Result<CompareSide, ApiError> {
+    if is_full_sha(raw) {
+        let sha = rev_parse_commit(r, raw).await?;
+        return Ok(CompareSide {
+            ref_name: raw.to_string(),
+            sha,
+        });
+    }
+    let res = resolve_name(r, raw).await?;
+    Ok(CompareSide {
+        ref_name: res.ref_name,
+        sha: res.sha,
+    })
+}
+
 /// `rev-parse --verify <rev>^{commit}`: local git when objects are on disk,
 /// the pack indexes (unique prefix, tag peel) when served remotely.
 async fn rev_parse_commit(r: &Repo, rev: &str) -> Result<String, ApiError> {
@@ -853,6 +922,68 @@ async fn git(local: &walgit_git::LocalRepo, args: Vec<String>) -> Result<Vec<u8>
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = local.git(&refs).await.map_err(internal)?;
     output_bytes(out)
+}
+
+/// Run `git` reading stdout up to `cap` bytes, then kill the child: a diff of
+/// a long-lived branch against a monorepo trunk can be hundreds of MiB, and
+/// the 2 MiB patch that ships must not buffer (let alone compute to
+/// completion) all of it. Returns at most `cap` bytes.
+async fn git_capped(
+    local: &walgit_git::LocalRepo,
+    args: &[&str],
+    cap: usize,
+) -> Result<Vec<u8>, ApiError> {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new("git")
+        .current_dir(local.path())
+        .env("GIT_DIR", local.path())
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(internal)?;
+    let Some(mut out) = child.stdout.take() else {
+        return Err(internal(format!("git {}: no stdout", args[0])));
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut capped = false;
+    loop {
+        let n = out.read(&mut chunk).await.map_err(internal)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n.min(cap - buf.len())]);
+        if buf.len() >= cap {
+            capped = true;
+            break;
+        }
+    }
+    if capped {
+        // The child is most likely blocked writing into the pipe we stopped
+        // draining; kill it before waiting.
+        child.kill().await.map_err(internal)?;
+    }
+    let status = child.wait().await.map_err(internal)?;
+    if !capped && !status.success() {
+        return Err(internal(format!("git {} failed: {status}", args[0])));
+    }
+    Ok(buf)
+}
+
+/// Files changed, from `git diff --shortstat` (" 3 files changed, …", empty
+/// output for an empty diff). One line of output, so the count is known
+/// before the numstat or the patch buffers anything.
+fn shortstat_files(out: &[u8]) -> usize {
+    String::from_utf8_lossy(out)
+        .split(" changed")
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .next()
+        .and_then(|w| w.parse().ok())
+        .unwrap_or(0)
 }
 
 fn parse_commit_record(record: &str) -> Option<Commit> {
@@ -1250,7 +1381,7 @@ async fn commits(
     Query(q): Query<CommitQuery>,
 ) -> Result<Response, ApiError> {
     let reference = q.ref_.clone().unwrap_or_else(|| "HEAD".into());
-    let skip = q.skip.unwrap_or(0);
+    let skip = page_skip(q.skip)?;
     let n = q.n.unwrap_or(35).clamp(1, 200);
     let path = q.path.clone().unwrap_or_default();
     let key = is_full_sha(&reference)
@@ -1297,7 +1428,7 @@ async fn commits(
                     .walk(
                         start,
                         (!path.is_empty()).then_some(path.as_str()),
-                        skip + n + 1,
+                        skip.saturating_add(n).saturating_add(1),
                         &label,
                     )
                     .await?;
@@ -1326,7 +1457,17 @@ async fn commits(
                 commits: cs,
                 more,
             });
-            Ok(finish(&st2, &r, immutable, &key, &res.sha, body))
+            // The answer varies with skip/n/path, so the validator must too
+            // (RFC 9110: one ETag per representation). A path is folded in as
+            // a digest to keep the header value opaque and quotable.
+            let mut etag = format!("{}-{skip}-{n}", res.sha);
+            if !path.is_empty() {
+                use sha1::Digest as _;
+                let d = hex::encode(sha1::Sha1::digest(path.as_bytes()));
+                etag.push('-');
+                etag.push_str(&d[..12]);
+            }
+            Ok(finish(&st2, &r, immutable, &key, &etag, body))
         },
     )
     .await
@@ -1482,6 +1623,286 @@ fn normalize_rename(s: &str) -> String {
     s.to_string()
 }
 
+// ---- compare ---------------------------------------------------------------------
+
+fn compare_key(repo: &str, base: &str, head: &str, skip: usize, n: usize) -> String {
+    format!("{repo}\0compare\0{base}\0{head}\0{skip}\0{n}")
+}
+
+fn unrelated(base: &str, head: &str) -> ApiError {
+    not_found(format!(
+        "no merge base: {base} and {head} are unrelated histories"
+    ))
+}
+
+/// Split `{base}...{head}`. `git check-ref-format` forbids `..` in a ref name
+/// and neither a hex sha nor `HEAD` contains a dot-pair, so one `...`
+/// separator is unambiguous; any other shape is a clean 400 before anything
+/// is resolved.
+fn split_compare(rest: &str) -> Result<(&str, &str), ApiError> {
+    let rest = rest.trim_matches('/');
+    let parts: Vec<&str> = rest.split("...").collect();
+    match parts.as_slice() {
+        [base, head] if !base.is_empty() && !head.is_empty() => Ok((base, head)),
+        _ => Err(ApiError::BadRequest(format!(
+            "expected {{base}}...{{head}}, got {rest:?}"
+        ))),
+    }
+}
+
+/// Cut a patch at [`MAX_PATCH`] bytes, preferring a whole-file boundary (the
+/// `\n` before a `diff --git ` line, so a patch parser never sees half a
+/// file), else the last newline, else a hard cut. Returns the patch and
+/// whether it was truncated.
+fn cap_patch(bytes: Vec<u8>) -> (String, bool) {
+    if bytes.len() <= MAX_PATCH {
+        return (String::from_utf8_lossy(&bytes).into_owned(), false);
+    }
+    let window = &bytes[..MAX_PATCH];
+    let cut = window
+        .windows(12)
+        .rposition(|w| w == b"\ndiff --git ")
+        .map_or_else(
+            || {
+                window
+                    .iter()
+                    .rposition(|b| *b == b'\n')
+                    .map_or(MAX_PATCH, |i| i + 1)
+            },
+            |i| i + 1,
+        );
+    (String::from_utf8_lossy(&bytes[..cut]).into_owned(), true)
+}
+
+async fn compare_root(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    compare_impl(&st, &headers, &owner, &repo_name, "", &CompareQuery::default()).await
+}
+
+async fn compare(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo_name, rest)): Path<(String, String, String)>,
+    Query(q): Query<CompareQuery>,
+) -> Result<Response, ApiError> {
+    compare_impl(&st, &headers, &owner, &repo_name, &rest, &q).await
+}
+
+/// `GET …/compare/{base}...{head}?skip=&n=` (D57): merge base, ahead/behind,
+/// one page of head-side commits, complete numstat and a capped patch of the
+/// three-dot (merge-base→head) diff. Two full shas make the answer immutable;
+/// anything else is SWR + `ETag: "<base sha>...<head sha>-<skip>-<n>"`.
+async fn compare_impl(
+    st: &Arc<AppState>,
+    headers: &HeaderMap,
+    owner: &str,
+    repo_name: &str,
+    rest: &str,
+    q: &CompareQuery,
+) -> Result<Response, ApiError> {
+    let (base_raw, head_raw) = split_compare(rest).map(|(b, h)| (b.to_string(), h.to_string()))?;
+    let skip = page_skip(q.skip)?;
+    let n = q.n.unwrap_or(35).clamp(1, 200);
+    let immutable = is_full_sha(&base_raw) && is_full_sha(&head_raw);
+    let key = immutable.then(|| {
+        compare_key(
+            &format!("{owner}/{repo_name}"),
+            &base_raw,
+            &head_raw,
+            skip,
+            n,
+        )
+    });
+    let st2 = st.clone();
+    run(
+        st,
+        headers,
+        owner,
+        repo_name,
+        Need::Objects,
+        key,
+        move |r| async move {
+            // Principle VII: one resolve per side.
+            let base = compare_side(&r, &base_raw).await?;
+            let head = compare_side(&r, &head_raw).await?;
+            let key = compare_key(&r.id, &base.sha, &head.sha, skip, n);
+            if immutable && let Some(hit) = st2.caches.api_immutable.get(&key) {
+                return Ok(Rendered::json(hit, IMMUTABLE, None));
+            }
+            let label = format!("Comparing {}...{}", &base.sha[..12], &head.sha[..12]);
+            let (merge_base, ahead, behind, cs, more) = if let Some(remote) = r.remote() {
+                remote.reporter.notice(format!(
+                    "{label} (walking commits from the WAL pack set)"
+                ));
+                let b = gix_hash::ObjectId::from_hex(base.sha.as_bytes())
+                    .map_err(|_| not_found("revision"))?;
+                let h = gix_hash::ObjectId::from_hex(head.sha.as_bytes())
+                    .map_err(|_| not_found("revision"))?;
+                let walk = remote.compare_walk(b, h, &label).await?;
+                let mb = walk
+                    .merge_base
+                    .ok_or_else(|| unrelated(&base.ref_name, &head.ref_name))?;
+                // `ahead` is exact, so the page flag is set arithmetic on it;
+                // `skip` is bounds-checked to 400 above.
+                let more = walk.ahead > skip && walk.ahead - skip > n;
+                let cs: Vec<Commit> = walk
+                    .page
+                    .into_iter()
+                    .skip(skip)
+                    .map(Commit::from)
+                    .collect();
+                // The commits, then every tree/blob the diff touches: git
+                // below runs against faulted loose objects, same as
+                // `commit/{sha}`.
+                remote.fault_many(&[b, h, mb]).await?;
+                let base_tree = remote.commit(&mb).await?.tree;
+                let head_tree = remote.commit(&h).await?.tree;
+                remote
+                    .fault_tree_diff(Some(base_tree), Some(head_tree))
+                    .await?;
+                (mb.to_string(), walk.ahead, walk.behind, cs, more)
+            } else {
+                // `merge-base` exit 1 with no output = unrelated histories;
+                // any other failure is git's own error (an unknown sha side).
+                let out = r
+                    .local
+                    .git(&["merge-base", &base.sha, &head.sha])
+                    .await
+                    .map_err(internal)?;
+                let mb = if out.status.success() {
+                    String::from_utf8_lossy(&out.stdout).trim().to_string()
+                } else if out.status.code() == Some(1) && out.stdout.is_empty() {
+                    return Err(unrelated(&base.ref_name, &head.ref_name));
+                } else {
+                    return Err(not_found(String::from_utf8_lossy(&out.stderr).trim()));
+                };
+                // `--left-right --count b...h` prints `behind\tahead`
+                // (left = base-only).
+                let counts = git(
+                    &r.local,
+                    vec![
+                        "rev-list".into(),
+                        "--left-right".into(),
+                        "--count".into(),
+                        format!("{}...{}", base.sha, head.sha),
+                    ],
+                )
+                .await?;
+                let (behind, ahead) = parse_counts(&counts)?;
+                let cs = parse_commits(
+                    &git(
+                        &r.local,
+                        vec![
+                            "log".into(),
+                            format!("--format={}", log_format()),
+                            "--no-color".into(),
+                            format!("--skip={skip}"),
+                            format!("-{}", n.saturating_add(1)),
+                            format!("{}..{}", base.sha, head.sha),
+                        ],
+                    )
+                    .await?,
+                );
+                let more = cs.len() > n;
+                (mb, ahead, behind, cs, more)
+            };
+            let mut cs = cs;
+            if cs.len() > n {
+                cs.truncate(n);
+            }
+            // Principle V, both lanes: bound the diff before rendering it.
+            // `--shortstat` prints one line, so the file count is known
+            // before the numstat (one line per file) or the patch buffers
+            // anything; the remote lane faults under the same object count.
+            let short = git(
+                &r.local,
+                vec![
+                    "diff".into(),
+                    "--shortstat".into(),
+                    "-M".into(),
+                    "--no-color".into(),
+                    merge_base.clone(),
+                    head.sha.clone(),
+                ],
+            )
+            .await?;
+            if shortstat_files(&short) > MAX_DIFF_OBJECTS {
+                return Err(ApiError::ServiceUnavailable(format!(
+                    "this diff touches more than {MAX_DIFF_OBJECTS} objects; too large to render"
+                )));
+            }
+            let stat_out = git(
+                &r.local,
+                vec![
+                    "diff".into(),
+                    "--numstat".into(),
+                    "-M".into(),
+                    "--no-color".into(),
+                    merge_base.clone(),
+                    head.sha.clone(),
+                ],
+            )
+            .await?;
+            let stats = parse_stats(&stat_out);
+            let (patch, patch_truncated) = cap_patch(
+                // Read at most one byte past the cap so `cap_patch` can tell
+                // "at the cap" from "past it"; the child is killed there.
+                git_capped(
+                    &r.local,
+                    &[
+                        "diff",
+                        "-M",
+                        "--no-color",
+                        "--no-ext-diff",
+                        &merge_base,
+                        &head.sha,
+                    ],
+                    MAX_PATCH + 1,
+                )
+                .await?,
+            );
+            // Each page is its own representation, so the validator covers
+            // skip/n too (RFC 9110: one ETag per representation).
+            let etag = format!("{}...{}-{skip}-{n}", base.sha, head.sha);
+            let body = json_bytes(&Compare {
+                base,
+                head,
+                merge_base,
+                ahead,
+                behind,
+                commits: cs,
+                more,
+                stats,
+                patch,
+                patch_truncated,
+            });
+            Ok(finish(&st2, &r, immutable, &key, &etag, body))
+        },
+    )
+    .await
+}
+
+/// Parse `rev-list --left-right --count` output: `behind\tahead`.
+fn parse_counts(bytes: &[u8]) -> Result<(usize, usize), ApiError> {
+    let text = String::from_utf8_lossy(bytes);
+    let (l, r) = text
+        .trim()
+        .split_once('\t')
+        .ok_or_else(|| internal(format!("rev-list --count output: {text:?}")))?;
+    let behind = l
+        .trim()
+        .parse()
+        .map_err(|_| internal(format!("rev-list --count output: {text:?}")))?;
+    let ahead = r
+        .trim()
+        .parse()
+        .map_err(|_| internal(format!("rev-list --count output: {text:?}")))?;
+    Ok((behind, ahead))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1494,5 +1915,84 @@ mod tests {
         assert_eq!(super::normalize_rename("a/{ => sub}/x.rs"), "a/sub/x.rs");
         assert_eq!(super::normalize_rename("old.rs => new.rs"), "new.rs");
         assert_eq!(super::normalize_rename("plain.rs"), "plain.rs");
+    }
+
+    #[test]
+    fn compare_split() {
+        let (b, h) = super::split_compare("main...feature/x").unwrap();
+        assert_eq!((b, h), ("main", "feature/x"));
+        assert_eq!(super::split_compare("main...feature/x/").unwrap().1, "feature/x");
+        // Ref names cannot contain `..`, so a slash-bearing head with `...`
+        // splits once; more than two parts or an empty side is a 400.
+        for bad in [
+            "",
+            "main",
+            "...main",
+            "main...",
+            "a...b...c",
+            "/",
+        ] {
+            assert!(
+                super::split_compare(bad).is_err(),
+                "{bad:?} must be a 400"
+            );
+        }
+    }
+
+    #[test]
+    fn compare_patch_cap() {
+        let file = |body_len: usize| {
+            format!("diff --git a/f b/f\n--- a/f\n+++ b/f\n{}", "x\n".repeat(body_len))
+        };
+        // Small patches pass through untouched.
+        let small = format!("{}{}", file(3), file(3));
+        let (p, truncated) = super::cap_patch(small.clone().into_bytes());
+        assert_eq!(p, small);
+        assert!(!truncated);
+        // Oversized: the cut keeps whole files (a `diff --git` boundary).
+        let big = format!("{}{}{}", file(600_000), file(600_000), file(600_000));
+        assert!(big.len() > super::MAX_PATCH);
+        let (p, truncated) = super::cap_patch(big.clone().into_bytes());
+        assert!(truncated);
+        assert!(p.len() <= super::MAX_PATCH);
+        assert!(
+            p.ends_with('\n'),
+            "cut at a line boundary: {}",
+            &p[p.len() - 40..]
+        );
+        assert!(!p.ends_with("diff --git a/f b/f\n"));
+        let files = p.matches("diff --git a/f b/f").count();
+        assert_eq!(files, 1, "the first file stays whole, the rest is dropped");
+        // One file alone above the cap: no boundary fits, cut at the last
+        // newline inside the cap.
+        let one = file(super::MAX_PATCH);
+        let (p, truncated) = super::cap_patch(one.clone().into_bytes());
+        assert!(truncated);
+        assert!(p.len() <= super::MAX_PATCH);
+        assert!(p.ends_with('\n'));
+        assert!(p.starts_with("diff --git a/f b/f"));
+    }
+
+    #[test]
+    fn paging_skip_bounds() {
+        assert_eq!(super::page_skip(None).unwrap(), 0);
+        assert_eq!(super::page_skip(Some(0)).unwrap(), 0);
+        assert_eq!(super::page_skip(Some(super::MAX_SKIP)).unwrap(), super::MAX_SKIP);
+        // A usize that would wrap the window arithmetic is a 400, not a wrap.
+        assert!(super::page_skip(Some(super::MAX_SKIP + 1)).is_err());
+        assert!(super::page_skip(Some(usize::MAX)).is_err());
+    }
+
+    #[test]
+    fn shortstat_file_count() {
+        assert_eq!(super::shortstat_files(b""), 0, "empty diff prints nothing");
+        assert_eq!(super::shortstat_files(b" 1 file changed"), 1);
+        assert_eq!(
+            super::shortstat_files(b" 3 files changed, 10 insertions(+), 2 deletions(-)"),
+            3
+        );
+        // Never more than a number: garbage parses as zero, the diff is then
+        // bounded by the object check downstream, not miscounted upward.
+        assert_eq!(super::shortstat_files(b"no summary"), 0);
     }
 }

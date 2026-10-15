@@ -18,13 +18,17 @@ use walgit_wal::{RemotePacks, Reporter};
 
 use crate::error::ApiError;
 
-/// Cap on objects faulted for one commit diff (pathological commits get a
-/// clear error instead of a multi-minute range-read storm).
-const MAX_DIFF_OBJECTS: usize = 20_000;
+/// Cap on objects faulted for one commit or compare diff (pathological diffs
+/// get a clear error instead of a multi-minute range-read storm).
+pub(crate) const MAX_DIFF_OBJECTS: usize = 20_000;
 /// Budget for "newest commit touching path" (tree header).
 const NEWEST_BUDGET: usize = 3_000;
 /// Budget for a history page walk (skip + n commits, plus skipped TREESAME ones).
 const WALK_BUDGET: usize = 50_000;
+/// Budget for one bilateral compare walk (`compare/{b}...{h}`): merge base +
+/// ahead/behind counts. Past it the counts would be guesses, so the endpoint
+/// answers the truthful 503 instead (principle V).
+const COMPARE_WALK_BUDGET: usize = 50_000;
 
 pub struct Remote {
     pub packs: Arc<RemotePacks>,
@@ -444,27 +448,312 @@ impl Remote {
         // peeks at their root trees, so fault those (one object each) but walk
         // the diff for the first parent alone — a merge into a monorepo trunk
         // otherwise pulls the whole other-branch delta (20 k+ objects, 503).
-        let mut stack: Vec<(Option<ObjectId>, Option<ObjectId>)> = Vec::new();
-        if c.parents.is_empty() {
-            stack.push((None, Some(c.tree)));
-        }
-        for (i, p) in c.parents.iter().enumerate() {
-            let pm = self.commit(p).await?;
-            self.fault(p).await?;
-            if i == 0 {
-                stack.push((Some(pm.tree), Some(c.tree)));
-            } else {
-                self.fault(&pm.tree).await?;
+        let first_parent_tree = match c.parents.first() {
+            Some(p) => {
+                let pm = self.commit(p).await?;
+                self.fault(p).await?;
+                for other in &c.parents[1..] {
+                    let om = self.commit(other).await?;
+                    self.fault(other).await?;
+                    self.fault(&om.tree).await?;
+                }
+                Some(pm.tree)
+            }
+            None => None,
+        };
+        self.fault_tree_diff(first_parent_tree, Some(c.tree))
+            .await?;
+        Ok(c)
+    }
+
+    /// Bilateral paint walk for `compare/{base}...{head}`: git's
+    /// paint-down-to-common simplified. Each side is seeded with one flag bit
+    /// (set when a queue entry is pushed, so one oid appears at most twice);
+    /// pops by `(commit_time desc, hop asc, seq desc)` (see [`Item`]). A pop
+    /// whose oid carries both
+    /// flags is common — the first such pop is the merge base, its parents are
+    /// marked common (every ancestor of a common commit is common) and a
+    /// one-sided count already taken for it is retracted. A pop with one flag
+    /// counts on that side (`behind` for base, `ahead` for head, which also
+    /// collects every head-side meta in pop order — retractions can remove an
+    /// already-collected entry, so only the caller's window bounds the page).
+    ///
+    /// The walk stops at the common frontier, git's `queue_has_nonstale`: once
+    /// every queued entry carries both flags, no further pop could count, so
+    /// the cost is O(ahead + behind), never O(shared ancestry) — a compare of
+    /// adjacent commits on a monorepo trunk walks two commits, not the trunk.
+    /// The drain below the frontier still retracts one-sided counts taken
+    /// above it (clock skew: a common commit can pop — and count — one-sided
+    /// before the frontier is found) and records the merge base, all in
+    /// memory; a counted commit whose commonality is only discoverable by
+    /// walking commits that were never queued stays counted, the same skew
+    /// caveat class git's own merge-base documents. `None` merge base =
+    /// unrelated histories. One pop past [`COMPARE_WALK_BUDGET`] ends with the
+    /// truthful 503: partial counts would be guesses.
+    pub async fn compare_walk(
+        &self,
+        base: ObjectId,
+        head: ObjectId,
+        label: &str,
+    ) -> Result<CompareWalk, ApiError> {
+        const BASE: u8 = 1;
+        const HEAD: u8 = 2;
+        /// Pop order: `(commit_time desc, hop asc, seq desc)`. `hop` is the
+        /// edge distance from the seed that reached the commit, so within one
+        /// timestamp (same-second commits — scripted pushes, imports) a
+        /// parent can never pop before its child: the order stays
+        /// topological where dates tie, which is what lets the frontier close
+        /// instead of one side draining below the merge base. git gets the
+        /// same property from commit-graph generation numbers; `seq` breaks
+        /// the remaining ties newest-push-first so a re-pushed common entry
+        /// outranks the descent it has to catch.
+        #[derive(PartialEq, Eq)]
+        struct Item(i64, usize, u64, ObjectId);
+        impl Ord for Item {
+            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                self.0
+                    .cmp(&o.0)
+                    .then_with(|| o.1.cmp(&self.1))
+                    .then_with(|| self.2.cmp(&o.2))
             }
         }
-        self.reporter.notice(format!(
-            "Reading the trees and blobs changed by {}",
-            &c.id.to_hex().to_string()[..12]
-        ));
-        // Level-parallel: every tree pair of the current level is faulted in
-        // one concurrent batch (range reads ~50 ms each; serially a large repository
-        // commit took 300 round trips = 15 s), then merge-walked; the blobs
-        // it references are faulted in a second batch. Rounds ≈ path depth.
+        impl PartialOrd for Item {
+            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        /// The queue plus its staleness bookkeeping. `live` counts entries per
+        /// oid; `nonstale` counts the live entries whose oid does not (yet)
+        /// carry both flags. Flags only ever gain bits, so an entry can turn
+        /// stale once, and when an oid's flags become both, every live entry
+        /// of it was pushed one-sided — `nonstale == 0` is exactly "all queued
+        /// entries are common".
+        #[derive(Default)]
+        struct Queue {
+            heap: BinaryHeap<Item>,
+            live: HashMap<ObjectId, usize>,
+            flags: HashMap<ObjectId, u8>,
+            nonstale: usize,
+            seq: u64,
+        }
+        impl Queue {
+            fn push(&mut self, time: i64, hop: usize, oid: ObjectId) {
+                *self.live.entry(oid).or_insert(0) += 1;
+                if self.flags[&oid] != BASE | HEAD {
+                    self.nonstale += 1;
+                }
+                self.heap.push(Item(time, hop, self.seq, oid));
+                self.seq += 1;
+            }
+            /// Give `oid` `bit` when new; true when the bit was added.
+            fn flag(&mut self, oid: ObjectId, bit: u8) -> bool {
+                let f = self.flags.entry(oid).or_insert(0);
+                if *f & bit != 0 {
+                    return false;
+                }
+                *f |= bit;
+                if *f == BASE | HEAD && let Some(n) = self.live.get(&oid) {
+                    self.nonstale -= *n;
+                }
+                true
+            }
+            /// Mark `oid` common outright; true when the flags changed.
+            fn mark_common(&mut self, oid: ObjectId) -> bool {
+                if self.flags.get(&oid).copied() == Some(BASE | HEAD) {
+                    return false;
+                }
+                self.flags.insert(oid, BASE | HEAD);
+                if let Some(n) = self.live.get(&oid) {
+                    self.nonstale -= *n;
+                }
+                true
+            }
+            fn pop(&mut self) -> Option<(ObjectId, usize)> {
+                let Item(_, hop, _, oid) = self.heap.pop()?;
+                if let Some(n) = self.live.get_mut(&oid) {
+                    *n -= 1;
+                }
+                if self.flags[&oid] != BASE | HEAD {
+                    self.nonstale -= 1;
+                }
+                Some((oid, hop))
+            }
+        }
+        // Push a queue entry for `oid` carrying `bit` when that bit is new;
+        // the meta (for `commit_time`) is read through the reader if unknown.
+        async fn enlist(
+            remote: &Remote,
+            q: &mut Queue,
+            metas: &mut HashMap<ObjectId, CommitMeta>,
+            oid: ObjectId,
+            hop: usize,
+            bit: u8,
+        ) -> Result<(), ApiError> {
+            if !q.flag(oid, bit) {
+                return Ok(());
+            }
+            let time = if let Some(m) = metas.get(&oid) {
+                m.commit_time
+            } else {
+                let m = remote.commit(&oid).await?;
+                metas.insert(oid, m.clone());
+                m.commit_time
+            };
+            q.push(time, hop, oid);
+            Ok(())
+        }
+        // Retract a one-sided count that later proved common.
+        fn retract(
+            counted: &mut HashMap<ObjectId, u8>,
+            ahead: &mut usize,
+            behind: &mut usize,
+            page: &mut Vec<CommitMeta>,
+            oid: ObjectId,
+        ) {
+            match counted.remove(&oid) {
+                Some(HEAD) => {
+                    *ahead = ahead.saturating_sub(1);
+                    page.retain(|m| m.id != oid);
+                }
+                Some(BASE) => *behind = behind.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if base == head {
+            return Ok(CompareWalk {
+                merge_base: Some(base),
+                ahead: 0,
+                behind: 0,
+                page: Vec::new(),
+            });
+        }
+        let mut q = Queue::default();
+        let mut metas: HashMap<ObjectId, CommitMeta> = HashMap::new();
+        // Parents of every popped commit: the drain below the frontier walks
+        // parent chains to retract skewed counts, and a popped commit's meta
+        // is consumed at its pop.
+        let mut parents: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        enlist(self, &mut q, &mut metas, base, 0, BASE).await?;
+        enlist(self, &mut q, &mut metas, head, 0, HEAD).await?;
+        let mut merge_base: Option<ObjectId> = None;
+        let mut ahead = 0usize;
+        let mut behind = 0usize;
+        let mut page: Vec<CommitMeta> = Vec::new();
+        let mut counted: HashMap<ObjectId, u8> = HashMap::new();
+        let mut popped = 0usize;
+        // Frontier loop: stops as soon as every queued entry is common.
+        while q.nonstale > 0 && let Some((oid, hop)) = q.pop() {
+            popped += 1;
+            if popped > COMPARE_WALK_BUDGET {
+                return Err(ApiError::ServiceUnavailable(format!(
+                    "comparing these refs walks more than {COMPARE_WALK_BUDGET} commits \
+                     (ahead + behind of the two sides); too large to answer from the \
+                     remote pack set"
+                )));
+            }
+            if popped.is_multiple_of(100) {
+                self.reporter
+                    .bar(label.to_string(), popped as u64, None, "commits");
+            }
+            if q.flags[&oid] == BASE | HEAD {
+                if merge_base.is_none() {
+                    merge_base = Some(oid);
+                }
+                retract(&mut counted, &mut ahead, &mut behind, &mut page, oid);
+                // Ancestors of a common commit are common: mark the parents
+                // (both flags) so they pop common too instead of counting.
+                let meta = match metas.remove(&oid) {
+                    Some(m) => m,
+                    None => self.commit(&oid).await?,
+                };
+                parents.insert(oid, meta.parents.clone());
+                for par in &meta.parents {
+                    if q.mark_common(*par) {
+                        let time = if let Some(m) = metas.get(par) {
+                            m.commit_time
+                        } else {
+                            let m = self.commit(par).await?;
+                            metas.insert(*par, m.clone());
+                            m.commit_time
+                        };
+                        q.push(time, hop + 1, *par);
+                    }
+                }
+                continue;
+            }
+            let side = q.flags[&oid];
+            let meta = match metas.remove(&oid) {
+                Some(m) => m,
+                None => self.commit(&oid).await?,
+            };
+            parents.insert(oid, meta.parents.clone());
+            if side == HEAD {
+                counted.insert(oid, HEAD);
+                ahead += 1;
+                page.push(meta.clone());
+            } else {
+                counted.insert(oid, BASE);
+                behind += 1;
+            }
+            for par in &meta.parents {
+                enlist(self, &mut q, &mut metas, *par, hop + 1, side).await?;
+            }
+        }
+        // Frontier drain, no reads: every queued entry is common. Pop them in
+        // pop order so the merge-base pick is the one a full drain would make,
+        // then walk the known parent chains retracting one-sided counts. Every
+        // queued or popped commit's parents are already in hand (a push reads
+        // the meta, a pop stores the parent list), and the descent stops at
+        // commits that were never queued — a counted commit cannot hide there,
+        // because counting takes a pop and a pop queues the parents.
+        let mut stack: Vec<ObjectId> = Vec::new();
+        while let Some(Item(_, _, _, oid)) = q.heap.pop() {
+            if merge_base.is_none() && q.flags[&oid] == BASE | HEAD {
+                merge_base = Some(oid);
+            }
+            stack.push(oid);
+        }
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        while let Some(oid) = stack.pop() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            retract(&mut counted, &mut ahead, &mut behind, &mut page, oid);
+            let ps = match metas.get(&oid) {
+                Some(m) => m.parents.clone(),
+                None => match parents.get(&oid) {
+                    Some(p) => p.clone(),
+                    None => continue,
+                },
+            };
+            stack.extend(ps);
+        }
+        Ok(CompareWalk {
+            merge_base,
+            ahead,
+            behind,
+            page,
+        })
+    }
+
+    /// Fault every tree on a differing path between two trees and the blobs of
+    /// the changed entries (both sides); `None` diffs against the empty tree
+    /// (a root commit, a side that has no such path). Level-parallel: every
+    /// tree pair of the current level is faulted in one concurrent batch
+    /// (range reads ~50 ms each; serially a large repository commit took 300
+    /// round trips = 15 s), then merge-walked; the blobs it references are
+    /// faulted in a second batch. Rounds ≈ path depth. Bounded by
+    /// [`MAX_DIFF_OBJECTS`] (the truthful 503 past it).
+    pub async fn fault_tree_diff(
+        &self,
+        base_tree: Option<ObjectId>,
+        head_tree: Option<ObjectId>,
+    ) -> Result<(), ApiError> {
+        if base_tree.is_none() && head_tree.is_none() {
+            return Ok(());
+        }
+        self.reporter.notice("Reading the trees and blobs of the diff".to_string());
+        let mut stack: Vec<(Option<ObjectId>, Option<ObjectId>)> = vec![(base_tree, head_tree)];
         let mut count = 0usize;
         while !stack.is_empty() {
             let level = std::mem::take(&mut stack);
@@ -478,8 +767,7 @@ impl Remote {
             count += want.len();
             if count > MAX_DIFF_OBJECTS {
                 return Err(ApiError::ServiceUnavailable(format!(
-                    "commit {} touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set",
-                    c.id
+                    "this diff touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set"
                 )));
             }
             self.fault_many(&want).await?;
@@ -564,8 +852,7 @@ impl Remote {
             count += blobs.len();
             if count > MAX_DIFF_OBJECTS {
                 return Err(ApiError::ServiceUnavailable(format!(
-                    "commit {} touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set",
-                    c.id
+                    "this diff touches more than {MAX_DIFF_OBJECTS} objects; too large to render from the remote pack set"
                 )));
             }
             self.fault_many(&blobs).await?;
@@ -574,8 +861,19 @@ impl Remote {
             .refresh_async()
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
-        Ok(c)
+        Ok(())
     }
+}
+
+/// The answer of one bilateral compare walk ([`Remote::compare_walk`]):
+/// a merge base (`None` = unrelated histories), the exact ahead/behind
+/// counts, and every head-side commit in pop order (newest first) — the
+/// caller windows it with `skip`/`n`.
+pub struct CompareWalk {
+    pub merge_base: Option<ObjectId>,
+    pub ahead: usize,
+    pub behind: usize,
+    pub page: Vec<CommitMeta>,
 }
 
 /// git's tree entry ordering: names compared as if trees had a trailing '/'.

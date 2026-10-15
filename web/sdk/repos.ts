@@ -126,6 +126,34 @@ export interface CommitDetail {
   stats: FileStat[];
   patch: string;
 }
+export interface CompareQuery {
+  /** Page window (defaults 0/35; `n` caps at 200). */
+  skip?: number;
+  n?: number;
+}
+/** One side of a compare: the resolved ref name and its sha. */
+export interface CompareSide {
+  ref: string;
+  sha: string;
+}
+/**
+ * `GET …/compare/{base}...{head}`: the between-two-refs answer. The diff is
+ * merge-base→head (the three-dot form). `stats` is complete; `patch` stops at
+ * 2 MiB with `patch_truncated: true`.
+ */
+export interface Compare {
+  base: CompareSide;
+  head: CompareSide;
+  merge_base: string;
+  ahead: number;
+  behind: number;
+  /** One page of head-side commits, newest first (`more` says another page exists). */
+  commits: Commit[];
+  more: boolean;
+  stats: FileStat[];
+  patch: string;
+  patch_truncated: boolean;
+}
 export interface RepoSummary {
   owner: string;
   name: string;
@@ -753,6 +781,14 @@ export class RepoClient {
   /** One commit with numstat + unified patch against the first parent. */
   commit(sha: string, opts?: CallOptions) {
     return this.client.json<CommitDetail>(`${this.p}/commit/${enc(sha)}`, opts);
+  }
+  /**
+   * Between two refs (D57): merge base, ahead/behind, one page of head-side
+   * commits, complete numstat and a capped (2 MiB) patch of the three-dot
+   * diff. Both sides full shas → immutable answer.
+   */
+  compare(base: string, head: string, q: CompareQuery = {}, opts?: CallOptions) {
+    return this.client.json<Compare>(`${this.p}/compare/${enc(base)}...${enc(head)}${qs(q)}`, opts);
   }
   /** WAL overview (walgit-specific). */
   overview(opts?: CallOptions) {

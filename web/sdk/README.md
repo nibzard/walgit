@@ -64,6 +64,7 @@ r.blob(rev, path)                            → { …, contents | binary | too_
 r.raw(rev, path)                             → string
 r.commits({ ref, path, skip, n })            → { ref, sha, commits, more }
 r.commit(sha)                                → { commit, stats, patch }
+r.compare(base, head, { skip, n })           → { base, head, merge_base, ahead, behind, commits, more, stats, patch, patch_truncated }
 r.overview()                                 → WAL overview (walgit-specific)
 r.snapshot(seq)                              → a WAL rewind the answering instance materialized (404 until it has)
 r.tasks()  /  r.task(id, onEvent?)           → what the answering instance is doing; attach to a task stream
@@ -87,8 +88,11 @@ are never `null`.
 ### Addressing: resolve once, then by sha
 
 Everything addressed by a **full sha** (`tree`, `blob`, `commits({ref: sha})`,
-`commit`) is immutable and cached by the browser for a year; everything
-addressed by a **name** is `stale-while-revalidate` + ETag. The cheap pattern
+`commit`, and a `compare(base, head)` whose two sides are both full shas) is
+immutable and cached by the browser for a year; everything addressed by a
+**name** is `stale-while-revalidate` + ETag (a compare's `ETag` is
+`"<base sha>...<head sha>-<skip>-<n>"`, so each page is its own
+representation). The cheap pattern
 is one `resolve()` (or `refs()`) per navigation, then sha-addressed calls:
 
 ```js

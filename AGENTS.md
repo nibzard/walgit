@@ -1,5 +1,10 @@
 # walgit — architecture and operating manual for contributors (humans and agents)
 
+> **This repository is a fork of walgit.** The remotes are inverted from convention: `origin` is
+> upstream (`tobi/walgit`) and `fork` is our fork (`nibzard/walgit`). Work flows one way only:
+> fetch and merge from `origin`, push every branch to `fork`. Never push to `origin`. Never open
+> a pull request, send a patch, or file an issue against upstream.
+
 Context: **everyone, first.** Read this before touching the repository: the constraints the design answers
 (§1), how the WAL works (§2), the principles a PR is judged against (§3), every design decision in force (§4),
 and the working rules (§5). Reading order starts at `GOAL.md`; §0 maps every other document.
@@ -584,6 +589,25 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   extra request. `PUT /{o}/{r}/api/head` (admin) retargets through the same publisher, the branch re-checked
   on every attempt, idempotent. Receive-pack refuses `HEAD` as a command name (`funny refname`), so policy
   sees every ref move; HEAD retargets emit no events (D32).
+
+- **D57 (2026-10-15): `compare/{base}...{head}` answers the between-two-refs question in one shape.**
+  `GET /{o}/{r}/api[-browser]/compare/{base}...{head}` closes the first-parent-only gap of `commit/{sha}`
+  (GOAL §4's browsing surface): each side is resolved once by the §3 rule (`...` cannot occur in a ref name,
+  so one split; malformed ranges get a clean 400; a full sha peels through `rev-parse^{commit}`, so a
+  tag-object sha answers the same as `resolve` on both lanes), then the answer carries merge base,
+  ahead/behind, one page of head-side commits (`skip`/`n`, default 35, cap 200, `more`), complete numstat,
+  and a patch capped at 2 MiB with `patch_truncated` — the diff is merge-base→head, the three-dot form. Two
+  full shas make the answer immutable (LRU + shared render cache); any name in it gets SWR +
+  `ETag: "<base sha>...<head sha>-<skip>-<n>"` — `skip`/`n` are in the validator as in the identity, so one
+  page never 304s another (`commits` folds `skip`/`n`/`path` into its ETag the same way); unrelated
+  histories are a 404 naming both sides. A remotely served repository reuses the `commit/{sha}` machinery:
+  the merge-base/ahead/behind paint walk stops at the common frontier (git's `queue_has_nonstale`) and is
+  bounded at 50 k pops = ahead + behind commits, never the shared ancestry; diff objects fault through the
+  remote reader under the same 20 k-object bound, which the local lane checks up front (shortstat before
+  numstat or patch buffer anything, the patch read itself byte-capped). Past either bound the truthful 503.
+  One surface: no two-dot form and no `?path=` (a per-file patch is a later decision); SDK
+  `repo.compare(base, head, {skip, n})`, with API.md, the discovery document and the API page moving in the
+  same change.
 
 ## 5. Working rules
 
