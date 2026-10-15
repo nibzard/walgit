@@ -304,6 +304,12 @@ Refs outside `refs/heads` and `refs/tags` (notes, review refs) are untouched.
 - Overlapping-bypass lockout: if two `protect` rules can match the same ref
   and the same op, and both have non-empty bypass lists whose intersection
   is empty, load fails. AND would make the intended bot unable to land.
+- `HEAD` is not a pushable name. A command for `HEAD` (or anything outside
+  `refs/`) is `ng … funny refname` under every policy, including none, as in
+  git's own receive-pack: through the symref it would move HEAD's branch
+  under a name no rule matches. HEAD's *target* is not a ref move and is not
+  evaluated: it changes only by the push heal rule (onto a branch the same
+  push was allowed to create) or the admin route `PUT …/api/head` (D55).
 
 ## What does not go in the JSON
 

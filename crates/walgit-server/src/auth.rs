@@ -15,7 +15,7 @@
 //!   Every path ends in the same allowlist: `allowed_domains` / `allowed_emails`,
 //!   `write_domains`.
 //! * **`proxy`** — an identity-aware proxy in front has already authenticated and
-//!   authorized the caller and says so in headers (D50): `X-Walgit-Principal` (who),
+//!   authorized the caller and says so in headers (D52): `X-Walgit-Principal` (who),
 //!   `X-Walgit-Access` (`read` | `write` | `admin`), optionally `X-Walgit-Owners` (the
 //!   owners that exist for this caller). The proxy proves itself on every request with
 //!   `X-Walgit-Proxy-Secret`, loopback listen included. A request that fails that proof

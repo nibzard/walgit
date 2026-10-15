@@ -524,8 +524,9 @@ pub fn evaluate(
     for u in &txn.updates {
         // A pushed command names a ref under `refs/`, never `HEAD` (git's own receive-pack refuses
         // it as a "funny refname"). `HEAD <oid>` would move HEAD's branch through the symref under a
-        // name no rule matches — around every `protect` on `refs/heads/*`. HEAD's target is a
-        // symbolic update (import), never a pushed command.
+        // name no rule matches — around every `protect` on `refs/heads/*`. HEAD's target moves only
+        // by the WAL's heal rule, the admin route (D55) and import; all are symbolic updates, never
+        // pushed.
         let denied = if u.new_symbolic_target.is_empty() && !u.name.starts_with("refs/") {
             Some("funny refname".to_string())
         } else {
