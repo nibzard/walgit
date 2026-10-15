@@ -1,0 +1,1 @@
+fork PR nibzard/walgit#1: compare endpoint per issue #40, D57; 10 review findings applied (blocker: walk stops at common frontier; ETag covers skip/n; page window skew-proof; skip bounded 1e9); gates web_api 12+11, just test, e2e, clippy, sim green
