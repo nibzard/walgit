@@ -1,0 +1,21 @@
+# Context
+
+## Why This Way
+The presigned-GET loop (PR #90) hard-coded its transient set and
+dropped 408, while every SDK path in s3.rs classifies 408 as
+transient via `is_transient_status` (PR #70). The fix aligns both
+the retry guard and the final classification so a surviving 408
+surfaces as `StoreError::Retryable` — `smart::wal_err` then maps
+it to a retryable 503 instead of a permanent 500.
+
+## Gotchas
+- The loop's guard cannot call `is_transient_status` directly: it
+  also gates on the attempt budget in the same match arm, and the
+  set must stay in sync by hand.
+- rustfs does not emit 408 on GET, so the contract suite cannot
+  cover this; the unit test uses `counting_fake_s3` instead.
+
+## Related
+- PR #70: `is_transient_status` / `is_transient_code` (408 added)
+- PR #90, commit 34f240d: retry budget in `presigned_get`
+- gcs.rs `is_retryable` uses the same status set
