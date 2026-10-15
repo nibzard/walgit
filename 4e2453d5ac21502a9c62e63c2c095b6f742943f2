@@ -1,0 +1,1 @@
+Fixup after 96: PROXY_SECRET[1..] -> PROXY_SECRET.get(1..) (clippy string_slice, -D warnings in just ci which batch 9's gate does not run). Caught at batch 11's just ci.
