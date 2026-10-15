@@ -526,7 +526,7 @@ impl ObjectStore for S3Store {
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
         let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
         if let Some(want) = &if_version {
-            request = request.if_match(want.as_str());
+            request = request.if_match(entity_tag(want));
         }
         let resp = request.send().await;
 
@@ -902,7 +902,7 @@ impl ObjectStore for S3Store {
         let complete = match &opts.mode {
             PutMode::Overwrite => complete,
             PutMode::Create => complete.if_none_match("*"),
-            PutMode::Update(v) => complete.if_match(v.as_str()),
+            PutMode::Update(v) => complete.if_match(entity_tag(v)),
         };
         let resp = match complete.send().await {
             Ok(r) => r,
@@ -1173,7 +1173,7 @@ impl S3Store {
         let complete = match &opts.mode {
             PutMode::Overwrite => complete,
             PutMode::Create => complete.if_none_match("*"),
-            PutMode::Update(v) => complete.if_match(v.as_str()),
+            PutMode::Update(v) => complete.if_match(entity_tag(v)),
         };
         let resp = match complete.send().await {
             Ok(r) => r,
@@ -1347,7 +1347,7 @@ mod tests {
             state.current = None;
             axum::http::StatusCode::NO_CONTENT.into_response()
         } else {
-            state.current = Some("published".into());
+            state.current = Some("\"published\"".into());
             "<CompleteMultipartUploadResult><ETag>\"published\"</ETag></CompleteMultipartUploadResult>".into_response()
         }
     }
@@ -1358,7 +1358,9 @@ mod tests {
         tokio::task::JoinHandle<()>,
     ) {
         let state = std::sync::Arc::new(parking_lot::Mutex::new(ConditionService {
-            current: Some("rival".into()),
+            // Quoted, like an ETag on the wire; versions in requests carry the
+            // same form after `entity_tag`.
+            current: Some("\"rival\"".into()),
             ..Default::default()
         }));
         let app = axum::Router::new()
@@ -1406,11 +1408,11 @@ mod tests {
         ));
         {
             let state = state.lock();
-            assert_eq!(state.current.as_deref(), Some("rival"));
+            assert_eq!(state.current.as_deref(), Some("\"rival\""));
             assert_eq!(state.requests.len(), 2);
             assert_eq!(state.requests[0].0, "DELETE", "no HEAD/check/delete window");
             assert_eq!(state.requests[1].0, "HEAD", "failure-only probe");
-            assert_eq!(state.requests[0].2.as_deref(), Some("captured"));
+            assert_eq!(state.requests[0].2.as_deref(), Some("\"captured\""));
         }
         store
             .delete("key", Some(Version::new("rival")))
@@ -1462,7 +1464,11 @@ mod tests {
                 let state = state.lock();
                 assert_eq!(
                     state.current.as_deref(),
-                    Some(if success { "published" } else { "rival" })
+                    Some(if success {
+                        "\"published\""
+                    } else {
+                        "\"rival\""
+                    })
                 );
                 let completes: Vec<_> = state
                     .requests
@@ -1470,6 +1476,11 @@ mod tests {
                     .filter(|(m, q, _, _)| m == "POST" && q.contains("uploadId"))
                     .collect();
                 assert_eq!(completes.len(), 1);
+                let complete_if_match = match &mode {
+                    PutMode::Update(v) => Some(entity_tag(v)),
+                    _ => None,
+                };
+                assert_eq!(completes[0].2.as_deref(), complete_if_match.as_deref());
                 assert_eq!(
                     completes[0].3.as_deref(),
                     matches!(mode, PutMode::Create).then_some("*")
@@ -1507,7 +1518,7 @@ mod tests {
                 "{result:?}"
             );
             let state = state.lock();
-            assert_eq!(state.current.as_deref(), Some("rival"));
+            assert_eq!(state.current.as_deref(), Some("\"rival\""));
             assert!(
                 !state
                     .requests
@@ -1819,11 +1830,16 @@ mod tests {
                 },
             )
             .await;
+        store
+            .delete("manifest.pb", Some(Version::new("abc")))
+            .await
+            .unwrap();
         let heads = heads.lock().clone();
-        assert_eq!(heads.len(), 3, "{heads:#?}");
+        assert_eq!(heads.len(), 4, "{heads:#?}");
         assert_eq!(header(&heads[0], "if-match"), Some("\"abc\""));
         assert_eq!(header(&heads[1], "if-none-match"), Some("\"abc\""));
         assert_eq!(header(&heads[2], "if-match"), Some("\"abc\""));
+        assert_eq!(header(&heads[3], "if-match"), Some("\"abc\""));
     }
 
     #[test]
