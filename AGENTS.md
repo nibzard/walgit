@@ -555,6 +555,13 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   read for GET, **admin** for every write, including `?description=` on create. One line of plain text,
   bounded; strict on write, lenient on read. No in-process cache (principle IV); the per-item GETs of a detail
   listing are the one multiplied cost (`docs/ROUNDTRIPS.md`). Git's own `description` file is not written.
+- **D54 (2026-10-01): `WALGIT__` overrides fail closed.** An environment override this build cannot
+  apply (malformed name, unknown section or key, wrong type) is a startup and `config check` error that
+  names each variable and the nearest known key; nothing of the batch is applied. This supersedes the
+  warn-and-ignore loader (2026-08-21: a key newer than one host's image crash-looped it): a host running
+  on a default it was told to change is the worse failure, and the file already refuses unknown keys.
+  Roll the image before the env that needs it; gate the rollout on `walgit config check --env-file`
+  run by the binary that will serve.
 
 ## 5. Working rules
 

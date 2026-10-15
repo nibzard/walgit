@@ -9,7 +9,7 @@ use walgit_config::Config;
 
 pub async fn run(action: ConfigAction, cfg: &Arc<Config>) -> Result<()> {
     match action {
-        ConfigAction::Check { env_files, strict } => {
+        ConfigAction::Check { env_files } => {
             let mut cfg: Config = (**cfg).clone();
             let mut vars: Vec<(String, String)> = Vec::new();
             for f in &env_files {
@@ -25,24 +25,11 @@ pub async fn run(action: ConfigAction, cfg: &Arc<Config>) -> Result<()> {
                     }
                 }
             }
-            let ignored = cfg.apply_env_report(vars.into_iter())?;
+            cfg.apply_env(vars.into_iter())?;
             cfg.validate()?;
             // Startup parses the baseline too; `check` must fail where startup would.
             walgit_server::policy::load_baseline(&cfg)?;
-            for (k, why) in &ignored {
-                eprintln!("ignored {k}: {why}");
-            }
-            if ignored.is_empty() {
-                println!("config OK");
-            } else {
-                println!(
-                    "config OK ({} override(s) ignored — unknown in this build)",
-                    ignored.len()
-                );
-                if strict {
-                    std::process::exit(3);
-                }
-            }
+            println!("config OK");
             Ok(())
         }
         ConfigAction::Dump => {
